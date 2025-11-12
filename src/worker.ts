@@ -39,6 +39,7 @@ interface DohApiResponse {
     matches_cloudflare: boolean;
     matches_google: boolean;
   };
+  ech_comparison?: DohEchComparison;
 }
 
 type EchBaseResult = {
@@ -113,7 +114,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       }
 
       const timeout = resolveTimeout(env.REQUEST_TIMEOUT_MS);
-      const testDomain = env.DEFAULT_TEST_DOMAIN?.trim() || "example.com";
+      const testDomain = env.DEFAULT_TEST_DOMAIN?.trim() || "linux.do";
 
       if (mode === "doh") {
         const result = await runDohCheck(target, testDomain, timeout);
@@ -176,6 +177,7 @@ async function runDohCheck(targetUrl: string, testDomain: string, timeout: numbe
 
   const matchesCloudflare = targetResult.ok && cloudflareResult.ok && setsAreEqual(new Set(targetResult.ips), new Set(cloudflareResult.ips));
   const matchesGoogle = targetResult.ok && googleResult.ok && setsAreEqual(new Set(targetResult.ips), new Set(googleResult.ips));
+  const echComparison = await runDohEchComparison(providers, testDomain, timeout);
 
   let status: DohStatus = "failure";
   let message = "目标 DoH 服务未返回有效结果。";
@@ -196,6 +198,14 @@ async function runDohCheck(targetUrl: string, testDomain: string, timeout: numbe
     message = "目标 DoH 服务返回的结果与 Cloudflare 和 Google 均不一致。";
   }
 
+  if (echComparison) {
+    if (echComparison.consistent === false) {
+      message += " 检测到目标 DoH 返回的 ECH 配置与权威解析不一致，可能存在篡改。";
+    } else if (echComparison.consistent === true) {
+      message += " 同时确认 ECH 配置与权威解析一致。";
+    }
+  }
+
   return {
     status,
     message,
@@ -204,6 +214,77 @@ async function runDohCheck(targetUrl: string, testDomain: string, timeout: numbe
       matches_cloudflare: matchesCloudflare,
       matches_google: matchesGoogle,
     },
+    ech_comparison: echComparison ?? undefined,
+  };
+}
+
+type DohEchComparison = {
+  target: EchProviderResult;
+  cloudflare: EchProviderResult;
+  google: EchProviderResult;
+  matches_cloudflare: boolean | null;
+  matches_google: boolean | null;
+  consistent: boolean | null;
+  notes: string[];
+};
+
+async function runDohEchComparison(providers: DohProviderConfig[], domain: string, timeout: number): Promise<DohEchComparison | null> {
+  const echProviders = providers.filter((provider) => provider.key === "target" || provider.key === "cloudflare" || provider.key === "google");
+  const fetchPromises = echProviders.map(({ key, endpoint }) =>
+    fetchHttpsRecord(endpoint, domain, timeout).then((result) => ({ key, result }))
+  );
+
+  const settled = await Promise.allSettled(fetchPromises);
+  const echResults = Object.fromEntries(
+    settled.map((entry, index) => {
+      const key = echProviders[index].key;
+      if (entry.status === "fulfilled") {
+        return [key, entry.value.result];
+      }
+      return [key, {
+        found: false,
+        record: undefined,
+        status: null,
+        latency_ms: null,
+        attempted_formats: [],
+        response_format: "unknown",
+        content_type: null,
+        error: normalizeErrorMessage(entry.reason),
+      } satisfies EchProviderResult];
+    })
+  ) as Record<ProviderKey, EchProviderResult>;
+
+  const targetResult = echResults.target;
+  const cloudflareResult = echResults.cloudflare;
+  const googleResult = echResults.google;
+
+  if (!targetResult && !cloudflareResult && !googleResult) {
+    return null;
+  }
+
+  const targetEch = extractEchConfigString(targetResult);
+  const cloudflareEch = extractEchConfigString(cloudflareResult);
+  const googleEch = extractEchConfigString(googleResult);
+
+  const notes: string[] = [];
+  const matchesCloudflare = computeEchMatch(targetEch, cloudflareEch, notes, "Cloudflare");
+  const matchesGoogle = computeEchMatch(targetEch, googleEch, notes, "Google");
+
+  let consistent: boolean | null = null;
+  if (matchesCloudflare !== null && matchesGoogle !== null) {
+    consistent = matchesCloudflare && matchesGoogle;
+  } else if (matchesCloudflare !== null || matchesGoogle !== null) {
+    consistent = matchesCloudflare === false || matchesGoogle === false ? false : null;
+  }
+
+  return {
+    target: targetResult,
+    cloudflare: cloudflareResult,
+    google: googleResult,
+    matches_cloudflare: matchesCloudflare,
+    matches_google: matchesGoogle,
+    consistent,
+    notes,
   };
 }
 
@@ -676,6 +757,51 @@ function combineEchFailures(results: EchProviderResult[]): EchProviderResult {
   merged.found = results.some((item) => item.found);
   merged.record = results.map((item) => item.record).find((record) => Boolean(record));
   return merged;
+}
+
+function extractEchConfigString(result?: EchProviderResult): string | null {
+  if (!result) return null;
+  if (!result.found || !result.record) {
+    if (typeof result.raw === "string") {
+      const parsed = parseEchFromRecordString(result.raw);
+      if (parsed) return parsed;
+    }
+    return null;
+  }
+  return parseEchFromRecordString(result.record);
+}
+
+function parseEchFromRecordString(record: string): string | null {
+  if (!record) return null;
+  const match = record.match(/ech(?:config\(base64\))?=("[^"]+"|[^\\s]+)/i);
+  if (!match) return null;
+  let value = match[1];
+  if (!value) return null;
+  if (value.startsWith("\"") && value.endsWith("\"")) {
+    value = value.slice(1, -1);
+  }
+  return value || null;
+}
+
+function computeEchMatch(target: string | null, reference: string | null, notes: string[], label: string): boolean | null {
+  if (!target && !reference) {
+    notes.push(`${label} 和目标 DoH 均未返回 ECH 配置。`);
+    return null;
+  }
+  if (!target) {
+    notes.push(`目标 DoH 未返回 ECH 配置，但 ${label} 返回了配置。`);
+    return false;
+  }
+  if (!reference) {
+    notes.push(`${label} 未返回 ECH 配置，无法比对。`);
+    return null;
+  }
+  if (target === reference) {
+    notes.push(`目标 DoH 与 ${label} 的 ECH 配置一致。`);
+    return true;
+  }
+  notes.push(`目标 DoH 与 ${label} 的 ECH 配置不一致。`);
+  return false;
 }
 
 function buildDnsQueryMessage(domain: string, recordType: number): Uint8Array {
@@ -1263,9 +1389,156 @@ const HTML_PAGE = /* html */ `<!DOCTYPE html>
     .badge.failure { color: var(--error); }
     .badge.partial { color: var(--primary); }
     .details {
-      margin-top: 12px;
+        margin-top: 18px;
+        border-radius: 14px;
+        border: 1px solid rgba(37, 99, 235, 0.18);
+        background: rgba(255, 255, 255, 0.65);
+        overflow: hidden;
+        transition: box-shadow 0.2s ease;
+      }
+      .details[open] {
+        box-shadow: 0 24px 48px -32px rgba(37, 99, 235, 0.55);
+      }
+      .details summary {
+        margin: 0;
+        padding: 14px 18px;
+        cursor: pointer;
+        font-weight: 600;
+        list-style: none;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+      .details summary::marker {
+        display: none;
+      }
+      .details summary span {
+        font-size: 0.9rem;
+        color: var(--muted);
+      }
+      .details[open] summary {
+        border-bottom: 1px solid rgba(37, 99, 235, 0.16);
+      }
+      .details-content {
+        padding: 18px;
+        display: grid;
+        gap: 18px;
+      }
+      .details-section {
+        border-radius: 12px;
+        border: 1px solid rgba(37, 99, 235, 0.2);
+        padding: 16px;
+        background: rgba(255, 255, 255, 0.75);
+        box-shadow: 0 18px 40px -32px rgba(37, 99, 235, 0.45);
+      }
+      .details-section h4 {
+        margin: 0 0 10px;
+        font-size: 1.05rem;
+      }
+      .provider-grid {
+        display: grid;
+        gap: 12px;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      }
+      .provider-card {
+        border: 1px solid rgba(37, 99, 235, 0.24);
+        border-radius: 12px;
+        padding: 12px 14px;
+        background: rgba(255, 255, 255, 0.85);
+        display: grid;
+        gap: 6px;
+      }
+      .provider-card.success {
+        border-color: rgba(5, 150, 105, 0.5);
+      }
+      .provider-card.failure {
+        border-color: rgba(220, 38, 38, 0.45);
+      }
+      .provider-card .name {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        font-weight: 600;
+      }
+      .provider-card .status {
+        font-size: 0.92rem;
+      }
+      .provider-card .status.success {
+        color: var(--success);
+      }
+      .provider-card .status.failure {
+        color: var(--error);
+      }
+      .provider-card .ips,
+      .provider-card .meta,
+      .provider-card .note {
+        font-size: 0.9rem;
+        color: var(--muted);
+      }
+      .provider-card .highlight {
+        font-size: 0.92rem;
+        color: var(--fg);
+        word-break: break-all;
+      }
+      .notes-list {
+        margin: 0;
+        padding-left: 20px;
+        color: var(--muted);
+        font-size: 0.95rem;
+      }
+      .notes-list li + li {
+        margin-top: 6px;
+      }
+    .ech-summary {
+      margin-top: 18px;
+      border-radius: 16px;
+      border: 1px solid rgba(37, 99, 235, 0.2);
+      background: rgba(255, 255, 255, 0.78);
+      padding: 18px 20px;
+      box-shadow: 0 20px 46px -26px rgba(37, 99, 235, 0.45);
+      display: grid;
+      gap: 14px;
     }
-    .mode-cards {
+    .ech-summary h3 {
+      margin: 0;
+      font-size: 1.15rem;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .ech-summary .summary-status {
+      font-size: 0.95rem;
+      font-weight: 600;
+    }
+    .ech-summary .summary-status.success {
+      color: var(--success);
+    }
+    .ech-summary .summary-status.failure {
+      color: var(--error);
+    }
+    .ech-summary .summary-status.neutral {
+      color: var(--muted);
+    }
+    .ech-summary .hint {
+      font-size: 0.9rem;
+      color: var(--muted);
+    }
+      .detail-status {
+        font-weight: 600;
+        font-size: 0.95rem;
+        margin-bottom: 10px;
+      }
+      .detail-status.success {
+        color: var(--success);
+      }
+      .detail-status.failure {
+        color: var(--error);
+      }
+      .detail-status.neutral {
+        color: var(--muted);
+      }
+      .mode-cards {
       margin-top: 16px;
       display: grid;
       gap: 12px;
@@ -1294,16 +1567,34 @@ const HTML_PAGE = /* html */ `<!DOCTYPE html>
       color: var(--muted);
       font-size: 0.9rem;
     }
-    details summary {
-      cursor: pointer;
-      font-weight: 600;
+    .mode-card .doc-link {
+      margin-top: 6px;
+      font-size: 0.88rem;
+      color: var(--primary);
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
     }
-    pre {
-      background: rgba(15, 23, 42, 0.85);
+    .mode-card .doc-link::after {
+      content: "↗";
+      font-size: 0.85rem;
+    }
+    .mode-card .doc-link:hover {
+      text-decoration: underline;
+    }
+    .raw-json pre {
+      background: rgba(15, 23, 42, 0.9);
       color: #f8fafc;
       padding: 16px;
       border-radius: 12px;
-      overflow-x: auto;
+      overflow: auto;
+      margin: 0;
+      max-height: 280px;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
+      word-break: break-word;
+      line-height: 1.45;
     }
     @media (max-width: 720px) {
       body { padding: 16px; }
@@ -1392,40 +1683,46 @@ const HTML_PAGE = /* html */ `<!DOCTYPE html>
       const badge = document.createElement('div');
       badge.classList.add('badge');
 
-      if (!ok || data.status === 'error') {
-        badge.classList.add('failure');
-        badge.textContent = '✖ 检测失败';
-        node.appendChild(badge);
-        const message = document.createElement('p');
-        message.textContent = data.message || '请求失败，请稍后重试。';
-        node.appendChild(message);
-        appendDetails(node, data);
-        node.classList.add('failure');
-        return;
+    if (!ok || data.status === 'error') {
+      badge.classList.add('failure');
+      badge.textContent = '✖ 检测失败';
+      node.appendChild(badge);
+      const message = document.createElement('p');
+      message.textContent = data.message || '请求失败，请稍后重试。';
+      node.appendChild(message);
+      if (mode === 'doh' && data?.ech_comparison) {
+        renderEchComparisonSummary(node, data.ech_comparison);
       }
+      appendDetails(node, data, mode);
+      node.classList.add('failure');
+      return;
+    }
 
-      if (mode === 'doh') {
-        const status = data.status;
-        if (status === 'success') {
-          badge.classList.add('success');
-          badge.textContent = '✔ 校验通过';
-          node.classList.add('success');
-        } else if (status === 'partial_match') {
-          badge.classList.add('partial');
-          badge.textContent = '△ 部分匹配';
-          node.classList.add('partial');
-        } else {
-          badge.classList.add('failure');
-          badge.textContent = '✖ 结果不一致';
-          node.classList.add('failure');
-        }
-        node.appendChild(badge);
-        const message = document.createElement('p');
-        message.textContent = data.message;
-        node.appendChild(message);
-        renderDohModeCards(node, data.details?.target);
-        appendDetails(node, data);
+    if (mode === 'doh') {
+      const status = data.status;
+      if (status === 'success') {
+        badge.classList.add('success');
+        badge.textContent = '✔ 校验通过';
+        node.classList.add('success');
+      } else if (status === 'partial_match') {
+        badge.classList.add('partial');
+        badge.textContent = '△ 部分匹配';
+        node.classList.add('partial');
       } else {
+        badge.classList.add('failure');
+        badge.textContent = '✖ 结果不一致';
+        node.classList.add('failure');
+      }
+      node.appendChild(badge);
+      const message = document.createElement('p');
+      message.textContent = data.message;
+      node.appendChild(message);
+      if (data.ech_comparison) {
+        renderEchComparisonSummary(node, data.ech_comparison);
+      }
+      renderDohModeCards(node, data.details?.target);
+      appendDetails(node, data, mode);
+    } else {
         if (data.ech_enabled) {
           badge.classList.add('success');
           badge.textContent = '✔ ECH 已启用';
@@ -1439,7 +1736,7 @@ const HTML_PAGE = /* html */ `<!DOCTYPE html>
         const message = document.createElement('p');
         message.textContent = data.message;
         node.appendChild(message);
-        appendDetails(node, data);
+      appendDetails(node, data, mode);
       }
     }
 
@@ -1454,17 +1751,294 @@ const HTML_PAGE = /* html */ `<!DOCTYPE html>
       node.appendChild(message);
     }
 
-    function appendDetails(node, data) {
+function renderEchComparisonSummary(node, comparison) {
+  const section = document.createElement('section');
+  section.classList.add('ech-summary');
+
+  const title = document.createElement('h3');
+  title.textContent = 'ECH 配置校验结果';
+  section.appendChild(title);
+
+  const status = document.createElement('div');
+  status.classList.add('summary-status');
+  if (comparison.consistent === true) {
+    status.classList.add('success');
+    status.textContent = '目标 DoH 的 ECH 配置与权威解析完全一致。';
+  } else if (comparison.consistent === false) {
+    status.classList.add('failure');
+    status.textContent = '检测到目标 DoH 的 ECH 配置与权威解析不一致，可能存在篡改风险。';
+  } else {
+    status.classList.add('neutral');
+    status.textContent = '暂无法确认目标 DoH 的 ECH 配置是否与权威解析一致。';
+  }
+  section.appendChild(status);
+
+  const echState = computeEchState(comparison);
+  if (echState.message) {
+    const stateLine = document.createElement('div');
+    stateLine.classList.add('hint');
+    stateLine.textContent = echState.message;
+    section.appendChild(stateLine);
+  }
+
+  const hint = document.createElement('div');
+  hint.classList.add('hint');
+  hint.textContent = '展开详细数据可查看各解析器的原始记录。';
+  section.appendChild(hint);
+
+  node.appendChild(section);
+}
+
+function computeEchState(comparison) {
+  const targetHasEch = providerHasEch(comparison.target);
+  const cloudflareHasEch = providerHasEch(comparison.cloudflare);
+  const googleHasEch = providerHasEch(comparison.google);
+  const authorityHasEch = cloudflareHasEch || googleHasEch;
+
+  if (!targetHasEch && !authorityHasEch) {
+    return {
+      code: 1,
+      message: '状态 1：目标 DoH、Cloudflare、Google 均未返回 ECH 配置。',
+    };
+  }
+
+  if (!targetHasEch && authorityHasEch) {
+    return {
+      code: 2,
+      message: '状态 2：权威解析（Cloudflare/Google）已提供 ECH，但目标 DoH 未返回，请检查自定义服务。',
+    };
+  }
+
+  if (targetHasEch && cloudflareHasEch && googleHasEch && comparison.consistent === true) {
+    return {
+      code: 3,
+      message: '状态 3：目标 DoH、Cloudflare、Google 均返回 ECH，配置完全一致。',
+    };
+  }
+
+  if (targetHasEch && authorityHasEch && comparison.consistent === false) {
+    return {
+      code: 4,
+      message: '状态 4：目标 DoH 返回 ECH，但与权威解析不一致，存在被篡改风险。',
+    };
+  }
+
+  return { code: 0, message: '' };
+}
+
+function providerHasEch(provider) {
+  if (!provider) return false;
+  if (provider.found && provider.record) return true;
+  if (typeof provider.record === 'string' && provider.record.toLowerCase().includes('ech')) return true;
+  if (typeof provider.raw === 'string' && provider.raw.toLowerCase().includes('ech')) return true;
+  return false;
+}
+
+      function appendDetails(node, data, mode) {
       const details = document.createElement('details');
       details.classList.add('details');
       const summary = document.createElement('summary');
-      summary.textContent = '查看详细数据';
+        summary.innerHTML = '查看详细数据 <span>展开以查看更多字段</span>';
       details.appendChild(summary);
-      const pre = document.createElement('pre');
-      pre.textContent = JSON.stringify(data, null, 2);
-      details.appendChild(pre);
+        const content = document.createElement('div');
+        content.classList.add('details-content');
+        details.appendChild(content);
+
+        buildDetailsSections(data, mode).forEach((section) => content.appendChild(section));
+        content.appendChild(buildRawJsonSection(data));
       node.appendChild(details);
     }
+
+      function buildDetailsSections(data, mode) {
+        const sections = [];
+        if (!data) return sections;
+        if (mode === 'doh' && data.details) {
+          sections.push(buildDohProvidersSection(data.details));
+        }
+        if (mode === 'ech' && data.providers) {
+          sections.push(buildEchProvidersSection(data.providers));
+        }
+        if (mode === 'doh' && data.ech_comparison) {
+          sections.push(buildEchComparisonSection(data.ech_comparison));
+        }
+        return sections;
+      }
+
+      function buildDohProvidersSection(details) {
+        const section = document.createElement('section');
+        section.classList.add('details-section');
+        const title = document.createElement('h4');
+        title.textContent = '解析器结果概览';
+        section.appendChild(title);
+
+        const grid = document.createElement('div');
+        grid.classList.add('provider-grid');
+        Object.entries(details).forEach(([key, provider]) => {
+          grid.appendChild(createDohProviderCard(key, provider));
+        });
+        section.appendChild(grid);
+        return section;
+      }
+
+      function buildEchProvidersSection(providers) {
+        const section = document.createElement('section');
+        section.classList.add('details-section');
+        const title = document.createElement('h4');
+        title.textContent = 'HTTPS 记录详情';
+        section.appendChild(title);
+
+        const grid = document.createElement('div');
+        grid.classList.add('provider-grid');
+        Object.entries(providers).forEach(([key, provider]) => {
+          grid.appendChild(createEchProviderCard(key, provider));
+        });
+        section.appendChild(grid);
+        return section;
+      }
+
+      function buildEchComparisonSection(comparison) {
+        const section = document.createElement('section');
+        section.classList.add('details-section');
+        const title = document.createElement('h4');
+        title.textContent = 'ECH 配置一致性';
+        section.appendChild(title);
+
+        const status = document.createElement('div');
+        status.classList.add('detail-status');
+        if (comparison.consistent === true) {
+          status.classList.add('success');
+          status.textContent = '目标 DoH 返回的 ECH 配置已与权威解析保持一致。';
+        } else if (comparison.consistent === false) {
+          status.classList.add('failure');
+          status.textContent = '检测到目标 DoH 返回的 ECH 配置与权威解析不一致。';
+        } else {
+          status.classList.add('neutral');
+          status.textContent = '暂无法给出明确的 ECH 一致性结论。';
+        }
+        section.appendChild(status);
+
+        if (Array.isArray(comparison.notes) && comparison.notes.length > 0) {
+          const list = document.createElement('ul');
+          list.classList.add('notes-list');
+          comparison.notes.forEach((note) => {
+            const item = document.createElement('li');
+            item.textContent = note;
+            list.appendChild(item);
+          });
+          section.appendChild(list);
+        }
+
+        const grid = document.createElement('div');
+        grid.classList.add('provider-grid');
+        grid.appendChild(createEchProviderCard('target', comparison.target));
+        grid.appendChild(createEchProviderCard('cloudflare', comparison.cloudflare));
+        grid.appendChild(createEchProviderCard('google', comparison.google));
+        section.appendChild(grid);
+
+        return section;
+      }
+
+      function buildRawJsonSection(data) {
+        const section = document.createElement('section');
+        section.classList.add('details-section', 'raw-json');
+        const title = document.createElement('h4');
+        title.textContent = '原始响应';
+        section.appendChild(title);
+        const pre = document.createElement('pre');
+        pre.textContent = JSON.stringify(data, null, 2);
+        section.appendChild(pre);
+        return section;
+      }
+
+      function createDohProviderCard(key, provider) {
+        const card = document.createElement('div');
+        card.classList.add('provider-card');
+        const ok = Boolean(provider?.ok);
+        card.classList.add(ok ? 'success' : 'failure');
+
+        const header = document.createElement('div');
+        header.classList.add('name');
+        const name = document.createElement('span');
+        name.textContent = formatProviderLabel(key);
+        const status = document.createElement('span');
+        status.classList.add('status', ok ? 'success' : 'failure');
+        status.textContent = ok ? '✔ 已返回有效记录' : '✖ 未能解析';
+        header.appendChild(name);
+        header.appendChild(status);
+        card.appendChild(header);
+
+        if (provider?.ips && provider.ips.length > 0) {
+          const ips = document.createElement('div');
+          ips.classList.add('ips');
+          ips.textContent = 'IP：' + provider.ips.join('、');
+          card.appendChild(ips);
+        }
+
+        const metaPieces = [];
+        if (typeof provider?.latency_ms === 'number') metaPieces.push('耗时 ' + provider.latency_ms + ' ms');
+        if (provider?.response_format) metaPieces.push('格式 ' + String(provider.response_format).toUpperCase());
+        if (provider?.content_type) metaPieces.push(provider.content_type);
+        if (metaPieces.length > 0) {
+          const meta = document.createElement('div');
+          meta.classList.add('meta');
+          meta.textContent = metaPieces.join(' | ');
+          card.appendChild(meta);
+        }
+
+        if (!ok && provider?.error) {
+          const note = document.createElement('div');
+          note.classList.add('note');
+          note.textContent = provider.error;
+          card.appendChild(note);
+        }
+
+        return card;
+      }
+
+      function createEchProviderCard(key, provider) {
+        const card = document.createElement('div');
+        card.classList.add('provider-card');
+        const hasEch = Boolean(provider && provider.found && provider.record);
+        card.classList.add(hasEch ? 'success' : 'failure');
+
+        const header = document.createElement('div');
+        header.classList.add('name');
+        const name = document.createElement('span');
+        name.textContent = formatProviderLabel(key);
+        const status = document.createElement('span');
+        status.classList.add('status', hasEch ? 'success' : 'failure');
+        status.textContent = hasEch ? '✔ 含 ECH 配置' : '✖ 未检测到 ECH';
+        header.appendChild(name);
+        header.appendChild(status);
+        card.appendChild(header);
+
+        if (provider?.record) {
+          const record = document.createElement('div');
+          record.classList.add('highlight');
+          record.textContent = provider.record;
+          card.appendChild(record);
+        }
+
+        const metaPieces = [];
+        if (typeof provider?.latency_ms === 'number') metaPieces.push('耗时 ' + provider.latency_ms + ' ms');
+        if (provider?.response_format) metaPieces.push('格式 ' + String(provider.response_format).toUpperCase());
+        if (provider?.content_type) metaPieces.push(provider.content_type);
+        if (metaPieces.length > 0) {
+          const meta = document.createElement('div');
+          meta.classList.add('meta');
+          meta.textContent = metaPieces.join(' | ');
+          card.appendChild(meta);
+        }
+
+        if (!hasEch && provider?.error) {
+          const note = document.createElement('div');
+          note.classList.add('note');
+          note.textContent = provider.error;
+          card.appendChild(note);
+        }
+
+        return card;
+      }
 
   function renderDohModeCards(node, targetDetail) {
     const modes = targetDetail?.mode_results || [];
@@ -1509,6 +2083,17 @@ const HTML_PAGE = /* html */ `<!DOCTYPE html>
         card.appendChild(meta);
       }
 
+      const docLink = getModeDocLink(entry.mode);
+      if (docLink) {
+        const link = document.createElement('a');
+        link.classList.add('doc-link');
+        link.href = docLink.href;
+        link.target = '_blank';
+        link.rel = 'noreferrer noopener';
+        link.textContent = docLink.label;
+        card.appendChild(link);
+      }
+
       container.appendChild(card);
     });
 
@@ -1529,6 +2114,36 @@ const HTML_PAGE = /* html */ `<!DOCTYPE html>
         return mode;
     }
   }
+
+function getModeDocLink(mode) {
+  switch (mode) {
+    case 'json':
+      return {
+        href: 'https://developers.google.com/speed/public-dns/docs/doh/json',
+        label: '查看 JSON DoH 权威说明',
+      };
+    case 'wire':
+      return {
+        href: 'https://www.rfc-editor.org/rfc/rfc8484',
+        label: '查看 RFC 8484 DoH 规范',
+      };
+    default:
+      return null;
+  }
+}
+
+    function formatProviderLabel(key) {
+      switch (key) {
+        case 'target':
+          return '目标 DoH';
+        case 'cloudflare':
+          return 'Cloudflare';
+        case 'google':
+          return 'Google';
+        default:
+          return key;
+      }
+    }
   </script>
 </body>
 </html>`;
