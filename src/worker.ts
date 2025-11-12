@@ -48,6 +48,8 @@ type DohProviderConfig = {
   endpoint: string;
 };
 
+type DohRequestMode = "json" | "wire";
+
 const CLOUDFLARE_DOH_ENDPOINT = "https://cloudflare-dns.com/dns-query";
 const GOOGLE_DOH_ENDPOINT = "https://dns.google/resolve";
 const HTTPS_RECORD_TYPE = 65;
@@ -220,32 +222,72 @@ async function runEchCheck(domain: string, timeout: number): Promise<EchApiRespo
 }
 
 async function fetchDohAnswer(endpoint: string, name: string, recordType: string, timeout: number): Promise<DohProviderResult> {
-  const url = buildDohUrl(endpoint, name, recordType);
+  const attempts: DohProviderResult[] = [];
+
+  const jsonAttempt = await performDohRequest(endpoint, name, recordType, timeout, "json");
+  if (jsonAttempt) {
+    if (jsonAttempt.ok) return jsonAttempt;
+    attempts.push(jsonAttempt);
+  }
+
+  const wireAttempt = await performDohRequest(endpoint, name, recordType, timeout, "wire");
+  if (wireAttempt) {
+    if (wireAttempt.ok) return wireAttempt;
+    attempts.push(wireAttempt);
+  }
+
+  if (attempts.length > 0) {
+    return combineDohFailures(attempts);
+  }
+
+  return {
+    status: null,
+    ok: false,
+    ips: [],
+    latency_ms: null,
+    error: "无法完成 DoH 查询。",
+  };
+}
+
+async function performDohRequest(endpoint: string, name: string, recordType: string, timeout: number, mode: DohRequestMode): Promise<DohProviderResult> {
+  let url: URL;
+  try {
+    url = mode === "json" ? buildDohJsonUrl(endpoint, name, recordType) : buildDohWireUrl(endpoint, name, recordType);
+  } catch (error) {
+    return {
+      status: null,
+      ok: false,
+      ips: [],
+      latency_ms: null,
+      error: normalizeErrorMessage(error),
+    };
+  }
+
+  const headers: HeadersInit = mode === "json"
+    ? { Accept: "application/dns-json" }
+    : { Accept: "application/dns-message" };
+
   const started = Date.now();
   try {
-    const response = await fetch(url, {
-      headers: { Accept: "application/dns-json" },
+    const response = await fetch(url.toString(), {
+      headers,
       signal: createTimeoutSignal(timeout),
     });
     const latency_ms = Date.now() - started;
     const status = response.status;
     const contentType = response.headers.get("content-type");
 
-    let raw: unknown = undefined;
-    let ips: string[] = [];
-
     if (isJsonContentType(contentType)) {
       try {
         const json = await response.json();
-        raw = json;
-        ips = extractIpsFromAnswer(json);
+        const ips = extractIpsFromAnswer(json);
         const ok = response.ok && ips.length > 0;
         return {
           status,
           ok,
           ips,
           latency_ms,
-          raw,
+          raw: json,
           error: ok ? undefined : "未在响应中找到有效的 A 记录。",
         };
       } catch (error) {
@@ -260,10 +302,24 @@ async function fetchDohAnswer(endpoint: string, name: string, recordType: string
       }
     }
 
-    const fallbackJson = await tryParseJsonClone(response);
-    if (fallbackJson) {
-      raw = fallbackJson;
-      ips = extractIpsFromAnswer(fallbackJson);
+    if (isTextContentType(contentType)) {
+      const text = await response.text();
+      const snippet = text.length > 200 ? `${text.slice(0, 200)}…` : text;
+      return {
+        status,
+        ok: false,
+        ips: [],
+        latency_ms,
+        raw: snippet,
+        error: snippet ? `服务器返回文本响应：${snippet}` : "服务器返回了文本响应。",
+      };
+    }
+
+    const buffer = await response.arrayBuffer();
+    const raw = createDnsMessageRaw(buffer, contentType);
+
+    try {
+      const ips = extractIpsFromDnsMessage(buffer);
       const ok = response.ok && ips.length > 0;
       return {
         status,
@@ -271,14 +327,8 @@ async function fetchDohAnswer(endpoint: string, name: string, recordType: string
         ips,
         latency_ms,
         raw,
-        error: ok ? undefined : "未在响应中找到有效的 A 记录。",
+        error: ok ? undefined : "未在响应中找到有效的 A/AAAA 记录。",
       };
-    }
-
-    const buffer = await response.arrayBuffer();
-    raw = createDnsMessageRaw(buffer, contentType);
-    try {
-      ips = extractIpsFromDnsMessage(buffer);
     } catch (error) {
       return {
         status,
@@ -289,16 +339,6 @@ async function fetchDohAnswer(endpoint: string, name: string, recordType: string
         error: `解析 DNS 二进制报文失败：${normalizeErrorMessage(error)}`,
       };
     }
-
-    const ok = response.ok && ips.length > 0;
-    return {
-      status,
-      ok,
-      ips,
-      latency_ms,
-      raw,
-      error: ok ? undefined : "未在响应中找到有效的 A/AAAA 记录。",
-    };
   } catch (error) {
     return {
       status: null,
@@ -311,11 +351,57 @@ async function fetchDohAnswer(endpoint: string, name: string, recordType: string
 }
 
 async function fetchHttpsRecord(endpoint: string, domain: string, timeout: number): Promise<EchProviderResult> {
-  const url = buildDohUrl(endpoint, domain, String(HTTPS_RECORD_TYPE));
+  const attempts: EchProviderResult[] = [];
+
+  const jsonAttempt = await performHttpsRequest(endpoint, domain, timeout, "json");
+  if (jsonAttempt) {
+    if (jsonAttempt.found) return jsonAttempt;
+    attempts.push(jsonAttempt);
+  }
+
+  const wireAttempt = await performHttpsRequest(endpoint, domain, timeout, "wire");
+  if (wireAttempt) {
+    if (wireAttempt.found) return wireAttempt;
+    attempts.push(wireAttempt);
+  }
+
+  if (attempts.length > 0) {
+    return combineEchFailures(attempts);
+  }
+
+  return {
+    found: false,
+    record: undefined,
+    status: null,
+    latency_ms: null,
+    error: "无法完成 HTTPS 记录查询。",
+  };
+}
+
+async function performHttpsRequest(endpoint: string, domain: string, timeout: number, mode: DohRequestMode): Promise<EchProviderResult> {
+  let url: URL;
+  try {
+    url = mode === "json"
+      ? buildDohJsonUrl(endpoint, domain, String(HTTPS_RECORD_TYPE))
+      : buildDohWireUrl(endpoint, domain, String(HTTPS_RECORD_TYPE));
+  } catch (error) {
+    return {
+      found: false,
+      record: undefined,
+      status: null,
+      latency_ms: null,
+      error: normalizeErrorMessage(error),
+    };
+  }
+
+  const headers: HeadersInit = mode === "json"
+    ? { Accept: "application/dns-json" }
+    : { Accept: "application/dns-message" };
+
   const started = Date.now();
   try {
-    const response = await fetch(url, {
-      headers: { Accept: "application/dns-json" },
+    const response = await fetch(url.toString(), {
+      headers,
       signal: createTimeoutSignal(timeout),
     });
     const latency_ms = Date.now() - started;
@@ -326,7 +412,7 @@ async function fetchHttpsRecord(endpoint: string, domain: string, timeout: numbe
       try {
         const json = await response.json();
         const record = extractHttpsRecord(json);
-        const found = Boolean(record);
+        const found = Boolean(record && record.includes("ech="));
         return {
           found,
           record: record ?? undefined,
@@ -347,17 +433,16 @@ async function fetchHttpsRecord(endpoint: string, domain: string, timeout: numbe
       }
     }
 
-    const fallbackJson = await tryParseJsonClone(response);
-    if (fallbackJson) {
-      const record = extractHttpsRecord(fallbackJson);
-      const found = Boolean(record);
+    if (isTextContentType(contentType)) {
+      const text = await response.text();
+      const snippet = text.length > 200 ? `${text.slice(0, 200)}…` : text;
       return {
-        found,
-        record: record ?? undefined,
+        found: false,
+        record: undefined,
         status,
         latency_ms,
-        raw: fallbackJson,
-        error: found ? undefined : "未发现包含 ECH 参数的 HTTPS 记录。",
+        raw: snippet,
+        error: snippet ? `服务器返回文本响应：${snippet}` : "服务器返回了文本响应。",
       };
     }
 
@@ -395,15 +480,157 @@ async function fetchHttpsRecord(endpoint: string, domain: string, timeout: numbe
   }
 }
 
-function buildDohUrl(endpoint: string, name: string, type: string): string {
-  try {
-    const url = new URL(endpoint);
-    url.searchParams.set("name", name);
-    url.searchParams.set("type", type);
-    return url.toString();
-  } catch (error) {
-    throw new Error(`无效的 DoH 端点: ${endpoint}. ${normalizeErrorMessage(error)}`);
+function buildDohJsonUrl(endpoint: string, name: string, type: string): URL {
+  const url = new URL(endpoint);
+  url.searchParams.set("name", name);
+  url.searchParams.set("type", type);
+  return url;
+}
+
+function buildDohWireUrl(endpoint: string, name: string, type: string): URL {
+  const recordType = recordTypeToNumber(type);
+  const hostname = normalizeDomain(name);
+  const query = buildDnsQueryMessage(hostname, recordType);
+  const url = new URL(endpoint);
+  url.searchParams.delete("name");
+  url.searchParams.delete("type");
+  url.searchParams.set("dns", bytesToBase64Url(query));
+  return url;
+}
+
+function combineDohFailures(results: DohProviderResult[]): DohProviderResult {
+  const merged = { ...results[results.length - 1] };
+  if (merged.status === null) {
+    for (const item of [...results].reverse()) {
+      if (item.status !== null) {
+        merged.status = item.status;
+        break;
+      }
+    }
   }
+  if (merged.latency_ms === null) {
+    for (const item of [...results].reverse()) {
+      if (item.latency_ms !== null) {
+        merged.latency_ms = item.latency_ms;
+        break;
+      }
+    }
+  }
+  const errors = results.map((item) => item.error).filter(Boolean) as string[];
+  merged.error = errors.length > 0 ? errors.join(" | ") : "DoH 查询失败。";
+  merged.ips = Array.from(new Set(results.flatMap((item) => item.ips)));
+  merged.ok = merged.ips.length > 0 && (merged.status ?? 0) >= 200 && (merged.status ?? 0) < 400;
+  return merged;
+}
+
+function combineEchFailures(results: EchProviderResult[]): EchProviderResult {
+  const merged = { ...results[results.length - 1] };
+  if (merged.status === null) {
+    for (const item of [...results].reverse()) {
+      if (item.status !== null) {
+        merged.status = item.status;
+        break;
+      }
+    }
+  }
+  if (merged.latency_ms === null) {
+    for (const item of [...results].reverse()) {
+      if (item.latency_ms !== null) {
+        merged.latency_ms = item.latency_ms;
+        break;
+      }
+    }
+  }
+  const errors = results.map((item) => item.error).filter(Boolean) as string[];
+  merged.error = errors.length > 0 ? errors.join(" | ") : "HTTPS 记录查询失败。";
+  merged.found = results.some((item) => item.found);
+  merged.record = results.map((item) => item.record).find((record) => Boolean(record));
+  return merged;
+}
+
+function buildDnsQueryMessage(domain: string, recordType: number): Uint8Array {
+  const labels = domain ? domain.split(".") : [];
+  let length = 12 + 1 + 4; // header + terminator + qtype/qclass
+  for (const label of labels) {
+    if (!label) continue;
+    if (label.length > 63) {
+      throw new Error(`域名标签过长: ${label}`);
+    }
+    length += 1 + label.length;
+  }
+
+  const buffer = new Uint8Array(length);
+  const view = new DataView(buffer.buffer);
+
+  const id = generateRequestId();
+  view.setUint16(0, id);
+  view.setUint16(2, 0x0100); // recursion desired
+  view.setUint16(4, 1); // QDCOUNT
+  view.setUint16(6, 0); // ANCOUNT
+  view.setUint16(8, 0); // NSCOUNT
+  view.setUint16(10, 0); // ARCOUNT
+
+  let offset = 12;
+  for (const label of labels) {
+    if (!label) continue;
+    buffer[offset] = label.length;
+    offset += 1;
+    for (let i = 0; i < label.length; i += 1) {
+      buffer[offset + i] = label.charCodeAt(i);
+    }
+    offset += label.length;
+  }
+
+  buffer[offset] = 0;
+  offset += 1;
+  view.setUint16(offset, recordType);
+  offset += 2;
+  view.setUint16(offset, 1); // IN class
+  return buffer;
+}
+
+function generateRequestId(): number {
+  if (typeof crypto !== "undefined" && "getRandomValues" in crypto) {
+    const arr = new Uint16Array(1);
+    crypto.getRandomValues(arr);
+    return arr[0];
+  }
+  return Math.floor(Math.random() * 0xffff);
+}
+
+function normalizeDomain(domain: string): string {
+  const trimmed = domain.trim();
+  if (!trimmed) {
+    throw new Error("域名不能为空。");
+  }
+  try {
+    const url = trimmed.includes("://") ? new URL(trimmed) : new URL(`https://${trimmed}`);
+    return url.hostname.replace(/\.$/, "");
+  } catch {
+    return trimmed.replace(/\.$/, "");
+  }
+}
+
+function recordTypeToNumber(recordType: string): number {
+  const upper = recordType.toUpperCase();
+  if (upper === "A") return 1;
+  if (upper === "AAAA") return 28;
+  if (upper === "HTTPS") return HTTPS_RECORD_TYPE;
+  const numeric = Number(recordType);
+  if (Number.isFinite(numeric) && numeric > 0) {
+    return numeric;
+  }
+  throw new Error(`不支持的 DNS 记录类型: ${recordType}`);
+}
+
+function isTextContentType(contentType: string | null): boolean {
+  if (!contentType) return false;
+  const normalized = contentType.toLowerCase();
+  return normalized.includes("text/") || normalized.includes("application/text") || normalized.includes("text/plain");
+}
+
+function bytesToBase64Url(bytes: Uint8Array): string {
+  return bytesToBase64(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
 function extractIpsFromAnswer(json: unknown): string[] {
@@ -728,6 +955,9 @@ function readDnsName(message: Uint8Array, offset: number): { name: string; lengt
       const pointer = ((len & 0x3f) << 8) | nextByte;
       if (!jumped) {
         length += 2;
+      }
+      if (pointer >= message.length) {
+        throw new Error("DNS 名称指针越界");
       }
       currentOffset = pointer;
       jumped = true;
