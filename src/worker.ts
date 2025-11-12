@@ -1533,14 +1533,18 @@ const HTML_PAGE = /* html */ `<!DOCTYPE html>
       color: var(--muted);
       font-size: 0.9rem;
     }
-      .raw-json pre {
-        background: rgba(15, 23, 42, 0.9);
-        color: #f8fafc;
-        padding: 16px;
-        border-radius: 12px;
-        overflow-x: auto;
-        margin: 0;
-        max-height: 280px;
+    .raw-json pre {
+      background: rgba(15, 23, 42, 0.9);
+      color: #f8fafc;
+      padding: 16px;
+      border-radius: 12px;
+      overflow: hidden;
+      margin: 0;
+      max-height: 280px;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
+      word-break: break-word;
+      line-height: 1.45;
     }
     @media (max-width: 720px) {
       body { padding: 16px; }
