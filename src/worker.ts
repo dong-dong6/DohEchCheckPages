@@ -1567,6 +1567,22 @@ const HTML_PAGE = /* html */ `<!DOCTYPE html>
       color: var(--muted);
       font-size: 0.9rem;
     }
+    .mode-card .doc-link {
+      margin-top: 6px;
+      font-size: 0.88rem;
+      color: var(--primary);
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .mode-card .doc-link::after {
+      content: "↗";
+      font-size: 0.85rem;
+    }
+    .mode-card .doc-link:hover {
+      text-decoration: underline;
+    }
     .raw-json pre {
       background: rgba(15, 23, 42, 0.9);
       color: #f8fafc;
@@ -1735,35 +1751,88 @@ const HTML_PAGE = /* html */ `<!DOCTYPE html>
       node.appendChild(message);
     }
 
-  function renderEchComparisonSummary(node, comparison) {
-    const section = document.createElement('section');
-    section.classList.add('ech-summary');
+function renderEchComparisonSummary(node, comparison) {
+  const section = document.createElement('section');
+  section.classList.add('ech-summary');
 
-    const title = document.createElement('h3');
-    title.textContent = 'ECH 配置校验结果';
-    section.appendChild(title);
+  const title = document.createElement('h3');
+  title.textContent = 'ECH 配置校验结果';
+  section.appendChild(title);
 
-    const status = document.createElement('div');
-    status.classList.add('summary-status');
-    if (comparison.consistent === true) {
-      status.classList.add('success');
-      status.textContent = '目标 DoH 的 ECH 配置与权威解析完全一致。';
-    } else if (comparison.consistent === false) {
-      status.classList.add('failure');
-      status.textContent = '检测到目标 DoH 的 ECH 配置与权威解析不一致，可能存在篡改风险。';
-    } else {
-      status.classList.add('neutral');
-      status.textContent = '暂无法确认目标 DoH 的 ECH 配置是否与权威解析一致。';
-    }
-    section.appendChild(status);
+  const status = document.createElement('div');
+  status.classList.add('summary-status');
+  if (comparison.consistent === true) {
+    status.classList.add('success');
+    status.textContent = '目标 DoH 的 ECH 配置与权威解析完全一致。';
+  } else if (comparison.consistent === false) {
+    status.classList.add('failure');
+    status.textContent = '检测到目标 DoH 的 ECH 配置与权威解析不一致，可能存在篡改风险。';
+  } else {
+    status.classList.add('neutral');
+    status.textContent = '暂无法确认目标 DoH 的 ECH 配置是否与权威解析一致。';
+  }
+  section.appendChild(status);
+
+  const echState = computeEchState(comparison);
+  if (echState.message) {
+    const stateLine = document.createElement('div');
+    stateLine.classList.add('hint');
+    stateLine.textContent = echState.message;
+    section.appendChild(stateLine);
+  }
 
   const hint = document.createElement('div');
   hint.classList.add('hint');
-  hint.textContent = '展开详细数据可查看 ECH 对比的完整信息。';
+  hint.textContent = '展开详细数据可查看各解析器的原始记录。';
   section.appendChild(hint);
 
-    node.appendChild(section);
+  node.appendChild(section);
+}
+
+function computeEchState(comparison) {
+  const targetHasEch = providerHasEch(comparison.target);
+  const cloudflareHasEch = providerHasEch(comparison.cloudflare);
+  const googleHasEch = providerHasEch(comparison.google);
+  const authorityHasEch = cloudflareHasEch || googleHasEch;
+
+  if (!targetHasEch && !authorityHasEch) {
+    return {
+      code: 1,
+      message: '状态 1：目标 DoH、Cloudflare、Google 均未返回 ECH 配置。',
+    };
   }
+
+  if (!targetHasEch && authorityHasEch) {
+    return {
+      code: 2,
+      message: '状态 2：权威解析（Cloudflare/Google）已提供 ECH，但目标 DoH 未返回，请检查自定义服务。',
+    };
+  }
+
+  if (targetHasEch && cloudflareHasEch && googleHasEch && comparison.consistent === true) {
+    return {
+      code: 3,
+      message: '状态 3：目标 DoH、Cloudflare、Google 均返回 ECH，配置完全一致。',
+    };
+  }
+
+  if (targetHasEch && authorityHasEch && comparison.consistent === false) {
+    return {
+      code: 4,
+      message: '状态 4：目标 DoH 返回 ECH，但与权威解析不一致，存在被篡改风险。',
+    };
+  }
+
+  return { code: 0, message: '' };
+}
+
+function providerHasEch(provider) {
+  if (!provider) return false;
+  if (provider.found && provider.record) return true;
+  if (typeof provider.record === 'string' && provider.record.toLowerCase().includes('ech')) return true;
+  if (typeof provider.raw === 'string' && provider.raw.toLowerCase().includes('ech')) return true;
+  return false;
+}
 
       function appendDetails(node, data, mode) {
       const details = document.createElement('details');
@@ -2014,6 +2083,17 @@ const HTML_PAGE = /* html */ `<!DOCTYPE html>
         card.appendChild(meta);
       }
 
+      const docLink = getModeDocLink(entry.mode);
+      if (docLink) {
+        const link = document.createElement('a');
+        link.classList.add('doc-link');
+        link.href = docLink.href;
+        link.target = '_blank';
+        link.rel = 'noreferrer noopener';
+        link.textContent = docLink.label;
+        card.appendChild(link);
+      }
+
       container.appendChild(card);
     });
 
@@ -2034,6 +2114,23 @@ const HTML_PAGE = /* html */ `<!DOCTYPE html>
         return mode;
     }
   }
+
+function getModeDocLink(mode) {
+  switch (mode) {
+    case 'json':
+      return {
+        href: 'https://developers.google.com/speed/public-dns/docs/doh/json',
+        label: '查看 JSON DoH 权威说明',
+      };
+    case 'wire':
+      return {
+        href: 'https://www.rfc-editor.org/rfc/rfc8484',
+        label: '查看 RFC 8484 DoH 规范',
+      };
+    default:
+      return null;
+  }
+}
 
     function formatProviderLabel(key) {
       switch (key) {
