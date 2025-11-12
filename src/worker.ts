@@ -1388,10 +1388,123 @@ const HTML_PAGE = /* html */ `<!DOCTYPE html>
     .badge.success { color: var(--success); }
     .badge.failure { color: var(--error); }
     .badge.partial { color: var(--primary); }
-    .details {
-      margin-top: 12px;
-    }
-    .mode-cards {
+      .details {
+        margin-top: 18px;
+        border-radius: 14px;
+        border: 1px solid rgba(37, 99, 235, 0.18);
+        background: rgba(255, 255, 255, 0.65);
+        overflow: hidden;
+        transition: box-shadow 0.2s ease;
+      }
+      .details[open] {
+        box-shadow: 0 24px 48px -32px rgba(37, 99, 235, 0.55);
+      }
+      .details summary {
+        margin: 0;
+        padding: 14px 18px;
+        cursor: pointer;
+        font-weight: 600;
+        list-style: none;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+      .details summary::marker {
+        display: none;
+      }
+      .details summary span {
+        font-size: 0.9rem;
+        color: var(--muted);
+      }
+      .details[open] summary {
+        border-bottom: 1px solid rgba(37, 99, 235, 0.16);
+      }
+      .details-content {
+        padding: 18px;
+        display: grid;
+        gap: 18px;
+      }
+      .details-section {
+        border-radius: 12px;
+        border: 1px solid rgba(37, 99, 235, 0.2);
+        padding: 16px;
+        background: rgba(255, 255, 255, 0.75);
+        box-shadow: 0 18px 40px -32px rgba(37, 99, 235, 0.45);
+      }
+      .details-section h4 {
+        margin: 0 0 10px;
+        font-size: 1.05rem;
+      }
+      .provider-grid {
+        display: grid;
+        gap: 12px;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      }
+      .provider-card {
+        border: 1px solid rgba(37, 99, 235, 0.24);
+        border-radius: 12px;
+        padding: 12px 14px;
+        background: rgba(255, 255, 255, 0.85);
+        display: grid;
+        gap: 6px;
+      }
+      .provider-card.success {
+        border-color: rgba(5, 150, 105, 0.5);
+      }
+      .provider-card.failure {
+        border-color: rgba(220, 38, 38, 0.45);
+      }
+      .provider-card .name {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        font-weight: 600;
+      }
+      .provider-card .status {
+        font-size: 0.92rem;
+      }
+      .provider-card .status.success {
+        color: var(--success);
+      }
+      .provider-card .status.failure {
+        color: var(--error);
+      }
+      .provider-card .ips,
+      .provider-card .meta,
+      .provider-card .note {
+        font-size: 0.9rem;
+        color: var(--muted);
+      }
+      .provider-card .highlight {
+        font-size: 0.92rem;
+        color: var(--fg);
+        word-break: break-all;
+      }
+      .notes-list {
+        margin: 0;
+        padding-left: 20px;
+        color: var(--muted);
+        font-size: 0.95rem;
+      }
+      .notes-list li + li {
+        margin-top: 6px;
+      }
+      .detail-status {
+        font-weight: 600;
+        font-size: 0.95rem;
+        margin-bottom: 10px;
+      }
+      .detail-status.success {
+        color: var(--success);
+      }
+      .detail-status.failure {
+        color: var(--error);
+      }
+      .detail-status.neutral {
+        color: var(--muted);
+      }
+      .mode-cards {
       margin-top: 16px;
       display: grid;
       gap: 12px;
@@ -1420,16 +1533,14 @@ const HTML_PAGE = /* html */ `<!DOCTYPE html>
       color: var(--muted);
       font-size: 0.9rem;
     }
-    details summary {
-      cursor: pointer;
-      font-weight: 600;
-    }
-    pre {
-      background: rgba(15, 23, 42, 0.85);
-      color: #f8fafc;
-      padding: 16px;
-      border-radius: 12px;
-      overflow-x: auto;
+      .raw-json pre {
+        background: rgba(15, 23, 42, 0.9);
+        color: #f8fafc;
+        padding: 16px;
+        border-radius: 12px;
+        overflow-x: auto;
+        margin: 0;
+        max-height: 280px;
     }
     @media (max-width: 720px) {
       body { padding: 16px; }
@@ -1525,7 +1636,7 @@ const HTML_PAGE = /* html */ `<!DOCTYPE html>
         const message = document.createElement('p');
         message.textContent = data.message || '请求失败，请稍后重试。';
         node.appendChild(message);
-        appendDetails(node, data);
+          appendDetails(node, data, mode);
         node.classList.add('failure');
         return;
       }
@@ -1550,7 +1661,7 @@ const HTML_PAGE = /* html */ `<!DOCTYPE html>
         message.textContent = data.message;
         node.appendChild(message);
         renderDohModeCards(node, data.details?.target);
-        appendDetails(node, data);
+          appendDetails(node, data, mode);
       } else {
         if (data.ech_enabled) {
           badge.classList.add('success');
@@ -1565,7 +1676,7 @@ const HTML_PAGE = /* html */ `<!DOCTYPE html>
         const message = document.createElement('p');
         message.textContent = data.message;
         node.appendChild(message);
-        appendDetails(node, data);
+          appendDetails(node, data, mode);
       }
     }
 
@@ -1580,17 +1691,211 @@ const HTML_PAGE = /* html */ `<!DOCTYPE html>
       node.appendChild(message);
     }
 
-    function appendDetails(node, data) {
+      function appendDetails(node, data, mode) {
       const details = document.createElement('details');
       details.classList.add('details');
       const summary = document.createElement('summary');
-      summary.textContent = '查看详细数据';
+        summary.innerHTML = '查看详细数据 <span>展开以查看更多字段</span>';
       details.appendChild(summary);
-      const pre = document.createElement('pre');
-      pre.textContent = JSON.stringify(data, null, 2);
-      details.appendChild(pre);
+        const content = document.createElement('div');
+        content.classList.add('details-content');
+        details.appendChild(content);
+
+        buildDetailsSections(data, mode).forEach((section) => content.appendChild(section));
+        content.appendChild(buildRawJsonSection(data));
       node.appendChild(details);
     }
+
+      function buildDetailsSections(data, mode) {
+        const sections = [];
+        if (!data) return sections;
+        if (mode === 'doh' && data.details) {
+          sections.push(buildDohProvidersSection(data.details));
+        }
+        if (mode === 'ech' && data.providers) {
+          sections.push(buildEchProvidersSection(data.providers));
+        }
+        if (mode === 'doh' && data.ech_comparison) {
+          sections.push(buildEchComparisonSection(data.ech_comparison));
+        }
+        return sections;
+      }
+
+      function buildDohProvidersSection(details) {
+        const section = document.createElement('section');
+        section.classList.add('details-section');
+        const title = document.createElement('h4');
+        title.textContent = '解析器结果概览';
+        section.appendChild(title);
+
+        const grid = document.createElement('div');
+        grid.classList.add('provider-grid');
+        Object.entries(details).forEach(([key, provider]) => {
+          grid.appendChild(createDohProviderCard(key, provider));
+        });
+        section.appendChild(grid);
+        return section;
+      }
+
+      function buildEchProvidersSection(providers) {
+        const section = document.createElement('section');
+        section.classList.add('details-section');
+        const title = document.createElement('h4');
+        title.textContent = 'HTTPS 记录详情';
+        section.appendChild(title);
+
+        const grid = document.createElement('div');
+        grid.classList.add('provider-grid');
+        Object.entries(providers).forEach(([key, provider]) => {
+          grid.appendChild(createEchProviderCard(key, provider));
+        });
+        section.appendChild(grid);
+        return section;
+      }
+
+      function buildEchComparisonSection(comparison) {
+        const section = document.createElement('section');
+        section.classList.add('details-section');
+        const title = document.createElement('h4');
+        title.textContent = 'ECH 配置一致性';
+        section.appendChild(title);
+
+        const status = document.createElement('div');
+        status.classList.add('detail-status');
+        if (comparison.consistent === true) {
+          status.classList.add('success');
+          status.textContent = '目标 DoH 返回的 ECH 配置已与权威解析保持一致。';
+        } else if (comparison.consistent === false) {
+          status.classList.add('failure');
+          status.textContent = '检测到目标 DoH 返回的 ECH 配置与权威解析不一致。';
+        } else {
+          status.classList.add('neutral');
+          status.textContent = '暂无法给出明确的 ECH 一致性结论。';
+        }
+        section.appendChild(status);
+
+        if (Array.isArray(comparison.notes) && comparison.notes.length > 0) {
+          const list = document.createElement('ul');
+          list.classList.add('notes-list');
+          comparison.notes.forEach((note) => {
+            const item = document.createElement('li');
+            item.textContent = note;
+            list.appendChild(item);
+          });
+          section.appendChild(list);
+        }
+
+        const grid = document.createElement('div');
+        grid.classList.add('provider-grid');
+        grid.appendChild(createEchProviderCard('target', comparison.target));
+        grid.appendChild(createEchProviderCard('cloudflare', comparison.cloudflare));
+        grid.appendChild(createEchProviderCard('google', comparison.google));
+        section.appendChild(grid);
+
+        return section;
+      }
+
+      function buildRawJsonSection(data) {
+        const section = document.createElement('section');
+        section.classList.add('details-section', 'raw-json');
+        const title = document.createElement('h4');
+        title.textContent = '原始响应';
+        section.appendChild(title);
+        const pre = document.createElement('pre');
+        pre.textContent = JSON.stringify(data, null, 2);
+        section.appendChild(pre);
+        return section;
+      }
+
+      function createDohProviderCard(key, provider) {
+        const card = document.createElement('div');
+        card.classList.add('provider-card');
+        const ok = Boolean(provider?.ok);
+        card.classList.add(ok ? 'success' : 'failure');
+
+        const header = document.createElement('div');
+        header.classList.add('name');
+        const name = document.createElement('span');
+        name.textContent = formatProviderLabel(key);
+        const status = document.createElement('span');
+        status.classList.add('status', ok ? 'success' : 'failure');
+        status.textContent = ok ? '✔ 已返回有效记录' : '✖ 未能解析';
+        header.appendChild(name);
+        header.appendChild(status);
+        card.appendChild(header);
+
+        if (provider?.ips && provider.ips.length > 0) {
+          const ips = document.createElement('div');
+          ips.classList.add('ips');
+          ips.textContent = 'IP：' + provider.ips.join('、');
+          card.appendChild(ips);
+        }
+
+        const metaPieces = [];
+        if (typeof provider?.latency_ms === 'number') metaPieces.push('耗时 ' + provider.latency_ms + ' ms');
+        if (provider?.response_format) metaPieces.push('格式 ' + String(provider.response_format).toUpperCase());
+        if (provider?.content_type) metaPieces.push(provider.content_type);
+        if (metaPieces.length > 0) {
+          const meta = document.createElement('div');
+          meta.classList.add('meta');
+          meta.textContent = metaPieces.join(' | ');
+          card.appendChild(meta);
+        }
+
+        if (!ok && provider?.error) {
+          const note = document.createElement('div');
+          note.classList.add('note');
+          note.textContent = provider.error;
+          card.appendChild(note);
+        }
+
+        return card;
+      }
+
+      function createEchProviderCard(key, provider) {
+        const card = document.createElement('div');
+        card.classList.add('provider-card');
+        const hasEch = Boolean(provider && provider.found && provider.record);
+        card.classList.add(hasEch ? 'success' : 'failure');
+
+        const header = document.createElement('div');
+        header.classList.add('name');
+        const name = document.createElement('span');
+        name.textContent = formatProviderLabel(key);
+        const status = document.createElement('span');
+        status.classList.add('status', hasEch ? 'success' : 'failure');
+        status.textContent = hasEch ? '✔ 含 ECH 配置' : '✖ 未检测到 ECH';
+        header.appendChild(name);
+        header.appendChild(status);
+        card.appendChild(header);
+
+        if (provider?.record) {
+          const record = document.createElement('div');
+          record.classList.add('highlight');
+          record.textContent = provider.record;
+          card.appendChild(record);
+        }
+
+        const metaPieces = [];
+        if (typeof provider?.latency_ms === 'number') metaPieces.push('耗时 ' + provider.latency_ms + ' ms');
+        if (provider?.response_format) metaPieces.push('格式 ' + String(provider.response_format).toUpperCase());
+        if (provider?.content_type) metaPieces.push(provider.content_type);
+        if (metaPieces.length > 0) {
+          const meta = document.createElement('div');
+          meta.classList.add('meta');
+          meta.textContent = metaPieces.join(' | ');
+          card.appendChild(meta);
+        }
+
+        if (!hasEch && provider?.error) {
+          const note = document.createElement('div');
+          note.classList.add('note');
+          note.textContent = provider.error;
+          card.appendChild(note);
+        }
+
+        return card;
+      }
 
   function renderDohModeCards(node, targetDetail) {
     const modes = targetDetail?.mode_results || [];
@@ -1655,6 +1960,19 @@ const HTML_PAGE = /* html */ `<!DOCTYPE html>
         return mode;
     }
   }
+
+    function formatProviderLabel(key) {
+      switch (key) {
+        case 'target':
+          return '目标 DoH';
+        case 'cloudflare':
+          return 'Cloudflare';
+        case 'google':
+          return 'Google';
+        default:
+          return key;
+      }
+    }
   </script>
 </body>
 </html>`;
