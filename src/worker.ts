@@ -1520,8 +1520,9 @@ const HTML_PAGE = /* html */ `<!DOCTYPE html>
     .ech-summary .summary-status.neutral {
       color: var(--muted);
     }
-    .ech-summary .provider-grid {
-      gap: 10px;
+    .ech-summary .hint {
+      font-size: 0.9rem;
+      color: var(--muted);
     }
       .detail-status {
         font-weight: 600;
@@ -1756,23 +1757,10 @@ const HTML_PAGE = /* html */ `<!DOCTYPE html>
     }
     section.appendChild(status);
 
-    const grid = document.createElement('div');
-    grid.classList.add('provider-grid');
-    grid.appendChild(createEchProviderCard('target', comparison.target));
-    grid.appendChild(createEchProviderCard('cloudflare', comparison.cloudflare));
-    grid.appendChild(createEchProviderCard('google', comparison.google));
-    section.appendChild(grid);
-
-    if (Array.isArray(comparison.notes) && comparison.notes.length > 0) {
-      const list = document.createElement('ul');
-      list.classList.add('notes-list');
-      comparison.notes.forEach((note) => {
-        const item = document.createElement('li');
-        item.textContent = note;
-        list.appendChild(item);
-      });
-      section.appendChild(list);
-    }
+  const hint = document.createElement('div');
+  hint.classList.add('hint');
+  hint.textContent = '展开详细数据可查看 ECH 对比的完整信息。';
+  section.appendChild(hint);
 
     node.appendChild(section);
   }
