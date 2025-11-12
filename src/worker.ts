@@ -206,7 +206,7 @@ async function runEchCheck(domain: string, timeout: number): Promise<EchApiRespo
     })
   ) as EchApiResponse["providers"];
 
-  const echEnabled = Object.values(providerResults).some((provider) => provider.found && provider.record?.includes("ech="));
+  const echEnabled = Object.values(providerResults).some((provider) => provider.found);
 
   const message = echEnabled
     ? "检测到 HTTPS 记录包含 ECH 参数，推测该域名已启用 ECH。"
@@ -229,29 +229,75 @@ async function fetchDohAnswer(endpoint: string, name: string, recordType: string
     });
     const latency_ms = Date.now() - started;
     const status = response.status;
-    let json: unknown = null;
+    const contentType = response.headers.get("content-type");
+
+    let raw: unknown = undefined;
+    let ips: string[] = [];
+
+    if (isJsonContentType(contentType)) {
+      try {
+        const json = await response.json();
+        raw = json;
+        ips = extractIpsFromAnswer(json);
+        const ok = response.ok && ips.length > 0;
+        return {
+          status,
+          ok,
+          ips,
+          latency_ms,
+          raw,
+          error: ok ? undefined : "未在响应中找到有效的 A 记录。",
+        };
+      } catch (error) {
+        return {
+          status,
+          ok: false,
+          ips: [],
+          latency_ms,
+          raw: null,
+          error: `解析 JSON 响应失败：${normalizeErrorMessage(error)}`,
+        };
+      }
+    }
+
+    const fallbackJson = await tryParseJsonClone(response);
+    if (fallbackJson) {
+      raw = fallbackJson;
+      ips = extractIpsFromAnswer(fallbackJson);
+      const ok = response.ok && ips.length > 0;
+      return {
+        status,
+        ok,
+        ips,
+        latency_ms,
+        raw,
+        error: ok ? undefined : "未在响应中找到有效的 A 记录。",
+      };
+    }
+
+    const buffer = await response.arrayBuffer();
+    raw = createDnsMessageRaw(buffer, contentType);
     try {
-      json = await response.json();
-    } catch {
+      ips = extractIpsFromDnsMessage(buffer);
+    } catch (error) {
       return {
         status,
         ok: false,
         ips: [],
         latency_ms,
-        raw: null,
-        error: "响应不是有效的 JSON 数据。",
+        raw,
+        error: `解析 DNS 二进制报文失败：${normalizeErrorMessage(error)}`,
       };
     }
 
-    const ips = extractIpsFromAnswer(json);
     const ok = response.ok && ips.length > 0;
     return {
       status,
       ok,
       ips,
       latency_ms,
-      raw: json,
-      error: ok ? undefined : "未在响应中找到有效的 A 记录。",
+      raw,
+      error: ok ? undefined : "未在响应中找到有效的 A/AAAA 记录。",
     };
   } catch (error) {
     return {
@@ -274,30 +320,70 @@ async function fetchHttpsRecord(endpoint: string, domain: string, timeout: numbe
     });
     const latency_ms = Date.now() - started;
     const status = response.status;
-    let json: unknown = null;
+    const contentType = response.headers.get("content-type");
+
+    if (isJsonContentType(contentType)) {
+      try {
+        const json = await response.json();
+        const record = extractHttpsRecord(json);
+        const found = Boolean(record);
+        return {
+          found,
+          record: record ?? undefined,
+          status,
+          latency_ms,
+          raw: json,
+          error: found ? undefined : "未发现包含 ECH 参数的 HTTPS 记录。",
+        };
+      } catch (error) {
+        return {
+          found: false,
+          record: undefined,
+          status,
+          latency_ms,
+          raw: null,
+          error: `解析 JSON 响应失败：${normalizeErrorMessage(error)}`,
+        };
+      }
+    }
+
+    const fallbackJson = await tryParseJsonClone(response);
+    if (fallbackJson) {
+      const record = extractHttpsRecord(fallbackJson);
+      const found = Boolean(record);
+      return {
+        found,
+        record: record ?? undefined,
+        status,
+        latency_ms,
+        raw: fallbackJson,
+        error: found ? undefined : "未发现包含 ECH 参数的 HTTPS 记录。",
+      };
+    }
+
+    const buffer = await response.arrayBuffer();
+    const raw = createDnsMessageRaw(buffer, contentType);
+
     try {
-      json = await response.json();
-    } catch {
+      const { found, record, error } = findHttpsRecordInDnsMessage(buffer);
+      return {
+        found,
+        record: record ?? undefined,
+        status,
+        latency_ms,
+        raw,
+        error: found ? undefined : error ?? "未发现包含 ECH 参数的 HTTPS 记录。",
+      };
+    } catch (error) {
       return {
         found: false,
         record: undefined,
         status,
         latency_ms,
-        error: "响应不是有效的 JSON 数据。",
+        raw,
+        error: `解析 DNS 二进制报文失败：${normalizeErrorMessage(error)}`,
       };
     }
-
-    const record = extractHttpsRecord(json);
-    const found = Boolean(record);
-
-    return {
-      found,
-      record: record ?? undefined,
-      status,
-      latency_ms,
-      raw: json,
-      error: found ? undefined : "未发现包含 ECH 参数的 HTTPS 记录。",
-    };
   } catch (error) {
     return {
       found: false,
@@ -428,6 +514,271 @@ function withCors(response: Response): Response {
   headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   headers.set("Access-Control-Allow-Headers", "Content-Type");
   return new Response(response.body, { ...response, headers });
+}
+
+function isJsonContentType(contentType: string | null): boolean {
+  if (!contentType) return false;
+  const normalized = contentType.toLowerCase();
+  return normalized.includes("application/dns-json") || normalized.includes("application/json") || normalized.includes("text/json");
+}
+
+async function tryParseJsonClone(response: Response): Promise<unknown | null> {
+  try {
+    const clone = response.clone();
+    return await clone.json();
+  } catch {
+    return null;
+  }
+}
+
+function createDnsMessageRaw(buffer: ArrayBuffer, contentType: string | null): { format: string; contentType: string | null; base64: string } {
+  return {
+    format: "dns-message",
+    contentType,
+    base64: arrayBufferToBase64(buffer),
+  };
+}
+
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  return bytesToBase64(bytes);
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 1) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  if (typeof btoa === "function") {
+    return btoa(binary);
+  }
+  // @ts-ignore Buffer 仅在某些构建环境可用
+  return Buffer.from(binary, "binary").toString("base64");
+}
+
+function extractIpsFromDnsMessage(buffer: ArrayBuffer): string[] {
+  const message = new Uint8Array(buffer);
+  if (message.length < 12) return [];
+  const view = new DataView(buffer);
+  const qdcount = view.getUint16(4);
+  const ancount = view.getUint16(6);
+  let offset = 12;
+  const seen = new Set<string>();
+
+  for (let i = 0; i < qdcount; i += 1) {
+    const nameInfo = readDnsName(message, offset);
+    offset += nameInfo.length;
+    offset += 4; // type + class
+  }
+
+  for (let i = 0; i < ancount; i += 1) {
+    const nameInfo = readDnsName(message, offset);
+    offset += nameInfo.length;
+
+    if (offset + 10 > message.length) break;
+    const type = view.getUint16(offset);
+    offset += 2;
+    offset += 2; // class
+    offset += 4; // ttl
+    const rdlength = view.getUint16(offset);
+    offset += 2;
+    if (offset + rdlength > message.length) break;
+
+    if (type === 1 && rdlength === 4) {
+      const ip = formatIpv4(message.subarray(offset, offset + 4));
+      seen.add(ip);
+    } else if (type === 28 && rdlength === 16) {
+      const ip = formatIpv6(message.subarray(offset, offset + 16));
+      seen.add(ip);
+    }
+
+    offset += rdlength;
+  }
+
+  return Array.from(seen);
+}
+
+function findHttpsRecordInDnsMessage(buffer: ArrayBuffer): { found: boolean; record?: string; error?: string } {
+  const message = new Uint8Array(buffer);
+  if (message.length < 12) {
+    return { found: false, error: "DNS 报文过短。" };
+  }
+  const view = new DataView(buffer);
+  const qdcount = view.getUint16(4);
+  const ancount = view.getUint16(6);
+  let offset = 12;
+  let fallbackRecord: string | undefined;
+
+  try {
+    for (let i = 0; i < qdcount; i += 1) {
+      const nameInfo = readDnsName(message, offset);
+      offset += nameInfo.length;
+      offset += 4;
+    }
+
+    for (let i = 0; i < ancount; i += 1) {
+      const nameInfo = readDnsName(message, offset);
+      offset += nameInfo.length;
+
+      if (offset + 10 > message.length) break;
+      const type = view.getUint16(offset);
+      offset += 2;
+      offset += 2; // class
+      offset += 4; // ttl
+      const rdlength = view.getUint16(offset);
+      offset += 2;
+      if (offset + rdlength > message.length) break;
+
+      if (type === HTTPS_RECORD_TYPE) {
+        const { hasEch, description } = parseHttpsSvcbRecord(message, offset, rdlength);
+        if (hasEch) {
+          return { found: true, record: description };
+        }
+        if (!fallbackRecord && description) {
+          fallbackRecord = description;
+        }
+      }
+
+      offset += rdlength;
+    }
+  } catch (error) {
+    return { found: false, error: normalizeErrorMessage(error) };
+  }
+
+  return { found: false, record: fallbackRecord };
+}
+
+function parseHttpsSvcbRecord(message: Uint8Array, offset: number, rdlength: number): { hasEch: boolean; description: string } {
+  if (offset + rdlength > message.length) {
+    return { hasEch: false, description: "" };
+  }
+
+  const view = new DataView(message.buffer, message.byteOffset + offset, rdlength);
+  let cursor = 0;
+  if (rdlength < 4) {
+    return { hasEch: false, description: "" };
+  }
+
+  const priority = view.getUint16(cursor);
+  cursor += 2;
+
+  const nameInfo = readDnsName(message, offset + cursor);
+  cursor += nameInfo.length;
+  const targetName = nameInfo.name || ".";
+
+  const params: string[] = [];
+  let hasEch = false;
+  let echBase64: string | undefined;
+
+  while (cursor < rdlength) {
+    if (cursor + 4 > rdlength) {
+      break;
+    }
+    const key = view.getUint16(cursor);
+    cursor += 2;
+    const valueLength = view.getUint16(cursor);
+    cursor += 2;
+    if (cursor + valueLength > rdlength) {
+      break;
+    }
+    const valueBytes = message.subarray(offset + cursor, offset + cursor + valueLength);
+    if (key === 5) {
+      hasEch = true;
+      echBase64 = bytesToBase64(valueBytes);
+    }
+    params.push(`key${key}(${valueLength}B)`);
+    cursor += valueLength;
+  }
+
+  let description = `priority=${priority} target=${targetName}`;
+  if (params.length > 0) {
+    description += ` params=[${params.join(", ")}]`;
+  }
+  if (hasEch) {
+    description += echBase64 ? ` echconfig(base64)=${echBase64}` : " echconfig";
+  }
+
+  return { hasEch, description };
+}
+
+function readDnsName(message: Uint8Array, offset: number): { name: string; length: number } {
+  const labels: string[] = [];
+  let length = 0;
+  let jumped = false;
+  let currentOffset = offset;
+  let safety = 0;
+
+  while (true) {
+    if (safety > message.length) {
+      throw new Error("DNS 名称解析超出安全限制");
+    }
+    safety += 1;
+
+    if (currentOffset >= message.length) {
+      throw new Error("DNS 名称超出报文范围");
+    }
+
+    const len = message[currentOffset];
+
+    if ((len & 0xc0) === 0xc0) {
+      const nextByte = message[currentOffset + 1];
+      if (nextByte === undefined) {
+        throw new Error("DNS 名称指针截断");
+      }
+      const pointer = ((len & 0x3f) << 8) | nextByte;
+      if (!jumped) {
+        length += 2;
+      }
+      currentOffset = pointer;
+      jumped = true;
+      continue;
+    }
+
+    if (len === 0) {
+      if (!jumped) {
+        length += 1;
+      }
+      break;
+    }
+
+    if (len > 63) {
+      throw new Error("DNS 标签长度非法");
+    }
+
+    const start = currentOffset + 1;
+    const end = start + len;
+    if (end > message.length) {
+      throw new Error("DNS 标签超出报文范围");
+    }
+    labels.push(readLabel(message, start, len));
+    currentOffset = end;
+    if (!jumped) {
+      length += 1 + len;
+    }
+  }
+
+  return { name: labels.join("."), length };
+}
+
+function readLabel(message: Uint8Array, start: number, length: number): string {
+  let label = "";
+  for (let i = 0; i < length; i += 1) {
+    label += String.fromCharCode(message[start + i]);
+  }
+  return label;
+}
+
+function formatIpv4(bytes: Uint8Array): string {
+  return `${bytes[0]}.${bytes[1]}.${bytes[2]}.${bytes[3]}`;
+}
+
+function formatIpv6(bytes: Uint8Array): string {
+  const segments: string[] = [];
+  for (let i = 0; i < 8; i += 1) {
+    const segment = (bytes[i * 2] << 8) | bytes[i * 2 + 1];
+    segments.push(segment.toString(16));
+  }
+  return segments.join(":");
 }
 
 const IP_V4_REGEX = /^(?:\d{1,3}\.){3}\d{1,3}$/;
