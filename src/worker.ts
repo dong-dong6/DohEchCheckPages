@@ -39,6 +39,7 @@ interface DohApiResponse {
     matches_cloudflare: boolean;
     matches_google: boolean;
   };
+  ech_comparison?: DohEchComparison;
 }
 
 type EchBaseResult = {
@@ -113,7 +114,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       }
 
       const timeout = resolveTimeout(env.REQUEST_TIMEOUT_MS);
-      const testDomain = env.DEFAULT_TEST_DOMAIN?.trim() || "example.com";
+        const testDomain = env.DEFAULT_TEST_DOMAIN?.trim() || "doh-ech-check.dongdong741236.workers.dev";
 
       if (mode === "doh") {
         const result = await runDohCheck(target, testDomain, timeout);
@@ -138,7 +139,7 @@ function resolveTimeout(timeoutSetting?: string): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_TIMEOUT_MS;
 }
 
-async function runDohCheck(targetUrl: string, testDomain: string, timeout: number): Promise<DohApiResponse> {
+  async function runDohCheck(targetUrl: string, testDomain: string, timeout: number): Promise<DohApiResponse> {
   const providers: DohProviderConfig[] = [
     { key: "target", endpoint: targetUrl },
     { key: "cloudflare", endpoint: CLOUDFLARE_DOH_ENDPOINT },
@@ -174,8 +175,9 @@ async function runDohCheck(targetUrl: string, testDomain: string, timeout: numbe
   const cloudflareResult = details.cloudflare;
   const googleResult = details.google;
 
-  const matchesCloudflare = targetResult.ok && cloudflareResult.ok && setsAreEqual(new Set(targetResult.ips), new Set(cloudflareResult.ips));
-  const matchesGoogle = targetResult.ok && googleResult.ok && setsAreEqual(new Set(targetResult.ips), new Set(googleResult.ips));
+    const matchesCloudflare = targetResult.ok && cloudflareResult.ok && setsAreEqual(new Set(targetResult.ips), new Set(cloudflareResult.ips));
+    const matchesGoogle = targetResult.ok && googleResult.ok && setsAreEqual(new Set(targetResult.ips), new Set(googleResult.ips));
+    const echComparison = await runDohEchComparison(providers, testDomain, timeout);
 
   let status: DohStatus = "failure";
   let message = "目标 DoH 服务未返回有效结果。";
@@ -196,16 +198,95 @@ async function runDohCheck(targetUrl: string, testDomain: string, timeout: numbe
     message = "目标 DoH 服务返回的结果与 Cloudflare 和 Google 均不一致。";
   }
 
-  return {
-    status,
-    message,
-    details,
-    comparison: {
+    if (echComparison) {
+      if (echComparison.consistent === false) {
+        message += " 检测到目标 DoH 返回的 ECH 配置与权威解析不一致，可能存在篡改。";
+      } else if (echComparison.consistent === true) {
+        message += " 同时确认 ECH 配置与权威解析一致。";
+      }
+    }
+
+    return {
+      status,
+      message,
+      details,
+      comparison: {
+        matches_cloudflare: matchesCloudflare,
+        matches_google: matchesGoogle,
+      },
+      ech_comparison: echComparison ?? undefined,
+    };
+}
+
+  type DohEchComparison = {
+    target: EchProviderResult;
+    cloudflare: EchProviderResult;
+    google: EchProviderResult;
+    matches_cloudflare: boolean | null;
+    matches_google: boolean | null;
+    consistent: boolean | null;
+    notes: string[];
+  };
+
+  async function runDohEchComparison(providers: DohProviderConfig[], domain: string, timeout: number): Promise<DohEchComparison | null> {
+    const echProviders = providers.filter((provider) => provider.key === "target" || provider.key === "cloudflare" || provider.key === "google");
+    const fetchPromises = echProviders.map(({ key, endpoint }) =>
+      fetchHttpsRecord(endpoint, domain, timeout).then((result) => ({ key, result }))
+    );
+
+    const settled = await Promise.allSettled(fetchPromises);
+    const echResults = Object.fromEntries(
+      settled.map((entry, index) => {
+        const key = echProviders[index].key;
+        if (entry.status === "fulfilled") {
+          return [key, entry.value.result];
+        }
+        return [key, {
+          found: false,
+          record: undefined,
+          status: null,
+          latency_ms: null,
+          attempted_formats: [],
+          response_format: "unknown",
+          content_type: null,
+          error: normalizeErrorMessage(entry.reason),
+        } satisfies EchProviderResult];
+      })
+    ) as Record<ProviderKey, EchProviderResult>;
+
+    const targetResult = echResults.target;
+    const cloudflareResult = echResults.cloudflare;
+    const googleResult = echResults.google;
+
+    if (!targetResult && !cloudflareResult && !googleResult) {
+      return null;
+    }
+
+    const targetEch = extractEchConfigString(targetResult);
+    const cloudflareEch = extractEchConfigString(cloudflareResult);
+    const googleEch = extractEchConfigString(googleResult);
+
+    const notes: string[] = [];
+    const matchesCloudflare = computeEchMatch(targetEch, cloudflareEch, notes, "Cloudflare");
+    const matchesGoogle = computeEchMatch(targetEch, googleEch, notes, "Google");
+
+    let consistent: boolean | null = null;
+    if (matchesCloudflare !== null && matchesGoogle !== null) {
+      consistent = matchesCloudflare && matchesGoogle;
+    } else if (matchesCloudflare !== null || matchesGoogle !== null) {
+      consistent = matchesCloudflare === false || matchesGoogle === false ? false : null;
+    }
+
+    return {
+      target: targetResult,
+      cloudflare: cloudflareResult,
+      google: googleResult,
       matches_cloudflare: matchesCloudflare,
       matches_google: matchesGoogle,
-    },
-  };
-}
+      consistent,
+      notes,
+    };
+  }
 
 async function runEchCheck(domain: string, timeout: number): Promise<EchApiResponse> {
   const providers: Array<{ key: "cloudflare" | "google"; endpoint: string }> = [
@@ -676,6 +757,51 @@ function combineEchFailures(results: EchProviderResult[]): EchProviderResult {
   merged.found = results.some((item) => item.found);
   merged.record = results.map((item) => item.record).find((record) => Boolean(record));
   return merged;
+}
+
+function extractEchConfigString(result?: EchProviderResult): string | null {
+  if (!result) return null;
+  if (!result.found || !result.record) {
+    if (typeof result.raw === "string") {
+      const parsed = parseEchFromRecordString(result.raw);
+      if (parsed) return parsed;
+    }
+    return null;
+  }
+  return parseEchFromRecordString(result.record);
+}
+
+function parseEchFromRecordString(record: string): string | null {
+  if (!record) return null;
+  const match = record.match(/ech(?:config\(base64\))?=("[^"]+"|[^\\s]+)/i);
+  if (!match) return null;
+  let value = match[1];
+  if (!value) return null;
+  if (value.startsWith("\"") && value.endsWith("\"")) {
+    value = value.slice(1, -1);
+  }
+  return value || null;
+}
+
+function computeEchMatch(target: string | null, reference: string | null, notes: string[], label: string): boolean | null {
+  if (!target && !reference) {
+    notes.push(`${label} 和目标 DoH 均未返回 ECH 配置。`);
+    return null;
+  }
+  if (!target) {
+    notes.push(`目标 DoH 未返回 ECH 配置，但 ${label} 返回了配置。`);
+    return false;
+  }
+  if (!reference) {
+    notes.push(`${label} 未返回 ECH 配置，无法比对。`);
+    return null;
+  }
+  if (target === reference) {
+    notes.push(`目标 DoH 与 ${label} 的 ECH 配置一致。`);
+    return true;
+  }
+  notes.push(`目标 DoH 与 ${label} 的 ECH 配置不一致。`);
+  return false;
 }
 
 function buildDnsQueryMessage(domain: string, recordType: number): Uint8Array {
