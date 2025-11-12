@@ -5,5 +5,5 @@ compatibility_date = "2025-11-12"
 workers_dev = true
 
 [vars]
-DEFAULT_TEST_DOMAIN = "cloudflare.com"
+DEFAULT_TEST_DOMAIN = "linux.do"
 REQUEST_TIMEOUT_MS = 5000
