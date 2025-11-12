@@ -11,16 +11,24 @@ type ProviderKey = "target" | "cloudflare" | "google";
 
 type DohResponseFormat = "json" | "wire" | "text" | "unknown";
 
-interface DohProviderResult {
+type DohBaseResult = {
   status: number | null;
   ok: boolean;
   ips: string[];
   latency_ms: number | null;
-  attempted_formats: DohRequestMode[];
   response_format?: DohResponseFormat;
   content_type?: string | null;
   raw?: unknown;
   error?: string;
+};
+
+interface DohProviderModeResult extends DohBaseResult {
+  mode: DohRequestMode;
+}
+
+interface DohProviderResult extends DohBaseResult {
+  attempted_formats: DohRequestMode[];
+  mode_results?: DohProviderModeResult[];
 }
 
 interface DohApiResponse {
@@ -33,16 +41,24 @@ interface DohApiResponse {
   };
 }
 
-interface EchProviderResult {
+type EchBaseResult = {
   found: boolean;
   record?: string;
   status: number | null;
   latency_ms: number | null;
-  attempted_formats: DohRequestMode[];
   response_format?: DohResponseFormat;
   content_type?: string | null;
-  error?: string;
   raw?: unknown;
+  error?: string;
+};
+
+interface EchProviderModeResult extends EchBaseResult {
+  mode: DohRequestMode;
+}
+
+interface EchProviderResult extends EchBaseResult {
+  attempted_formats: DohRequestMode[];
+  mode_results?: EchProviderModeResult[];
 }
 
 interface EchApiResponse {
@@ -236,47 +252,38 @@ async function runEchCheck(domain: string, timeout: number): Promise<EchApiRespo
 }
 
 async function fetchDohAnswer(endpoint: string, name: string, recordType: string, timeout: number): Promise<DohProviderResult> {
-  const attempts: DohProviderResult[] = [];
+  const modeResults: DohProviderModeResult[] = [];
 
-  const jsonAttempt = await performDohRequest(endpoint, name, recordType, timeout, "json");
-  if (jsonAttempt) {
-    if (jsonAttempt.ok) return jsonAttempt;
-    attempts.push(jsonAttempt);
+  for (const mode of ["json", "wire"] as const) {
+    const result = await performDohRequest(endpoint, name, recordType, timeout, mode);
+    modeResults.push(result);
   }
 
-  const wireAttempt = await performDohRequest(endpoint, name, recordType, timeout, "wire");
-  if (wireAttempt) {
-    if (wireAttempt.ok) return wireAttempt;
-    attempts.push(wireAttempt);
+  const successful = modeResults.find((item) => item.ok);
+  let summary: DohProviderResult;
+
+  if (successful) {
+    summary = summarizeDohModeResult(successful, modeResults);
+  } else {
+    summary = combineDohFailures(modeResults);
   }
 
-  if (attempts.length > 0) {
-    return combineDohFailures(attempts);
-  }
-
-  return {
-    status: null,
-    ok: false,
-    ips: [],
-    latency_ms: null,
-    attempted_formats: [],
-    response_format: "unknown",
-    content_type: null,
-    error: "无法完成 DoH 查询。",
-  };
+  summary.attempted_formats = modeResults.map((item) => item.mode);
+  summary.mode_results = modeResults;
+  return summary;
 }
 
-async function performDohRequest(endpoint: string, name: string, recordType: string, timeout: number, mode: DohRequestMode): Promise<DohProviderResult> {
+async function performDohRequest(endpoint: string, name: string, recordType: string, timeout: number, mode: DohRequestMode): Promise<DohProviderModeResult> {
   let url: URL;
   try {
     url = mode === "json" ? buildDohJsonUrl(endpoint, name, recordType) : buildDohWireUrl(endpoint, name, recordType);
   } catch (error) {
     return {
+      mode,
       status: null,
       ok: false,
       ips: [],
       latency_ms: null,
-      attempted_formats: [mode],
       response_format: "unknown",
       content_type: null,
       error: normalizeErrorMessage(error),
@@ -303,11 +310,11 @@ async function performDohRequest(endpoint: string, name: string, recordType: str
         const ips = extractIpsFromAnswer(json);
         const ok = response.ok && ips.length > 0;
         return {
+          mode,
           status,
           ok,
           ips,
           latency_ms,
-          attempted_formats: [mode],
           response_format: "json",
           content_type: contentType,
           raw: json,
@@ -315,11 +322,11 @@ async function performDohRequest(endpoint: string, name: string, recordType: str
         };
       } catch (error) {
         return {
+          mode,
           status,
           ok: false,
           ips: [],
           latency_ms,
-          attempted_formats: [mode],
           response_format: "json",
           content_type: contentType,
           raw: null,
@@ -332,11 +339,11 @@ async function performDohRequest(endpoint: string, name: string, recordType: str
       const text = await response.text();
       const snippet = text.length > 200 ? `${text.slice(0, 200)}…` : text;
       return {
+        mode,
         status,
         ok: false,
         ips: [],
         latency_ms,
-        attempted_formats: [mode],
         response_format: "text",
         content_type: contentType,
         raw: snippet,
@@ -351,11 +358,11 @@ async function performDohRequest(endpoint: string, name: string, recordType: str
       const ips = extractIpsFromDnsMessage(buffer);
       const ok = response.ok && ips.length > 0;
       return {
+        mode,
         status,
         ok,
         ips,
         latency_ms,
-        attempted_formats: [mode],
         response_format: "wire",
         content_type: contentType,
         raw,
@@ -363,11 +370,11 @@ async function performDohRequest(endpoint: string, name: string, recordType: str
       };
     } catch (error) {
       return {
+        mode,
         status,
         ok: false,
         ips: [],
         latency_ms,
-        attempted_formats: [mode],
         response_format: "wire",
         content_type: contentType,
         raw,
@@ -376,11 +383,11 @@ async function performDohRequest(endpoint: string, name: string, recordType: str
     }
   } catch (error) {
     return {
+      mode,
       status: null,
       ok: false,
       ips: [],
       latency_ms: null,
-      attempted_formats: [mode],
       response_format: "unknown",
       content_type: null,
       error: normalizeErrorMessage(error),
@@ -560,41 +567,78 @@ function buildDohWireUrl(endpoint: string, name: string, type: string): URL {
   return url;
 }
 
-function combineDohFailures(results: DohProviderResult[]): DohProviderResult {
-  const merged = { ...results[results.length - 1] };
-  merged.attempted_formats = Array.from(
-    new Set(results.flatMap((item) => item.attempted_formats ?? [])),
-  );
-  if (!merged.response_format || merged.response_format === "unknown") {
-    const responseFormat = results.map((item) => item.response_format).find((format) => format && format !== "unknown");
-    if (responseFormat) {
-      merged.response_format = responseFormat;
-    }
+function summarizeDohModeResult(successful: DohProviderModeResult, attempts: DohProviderModeResult[]): DohProviderResult {
+  const { mode, ...rest } = successful;
+  return {
+    ...rest,
+    attempted_formats: attempts.map((item) => item.mode),
+    mode_results: attempts,
+  };
+}
+
+function combineDohFailures(results: DohProviderModeResult[]): DohProviderResult {
+  if (results.length === 0) {
+    return {
+      status: null,
+      ok: false,
+      ips: [],
+      latency_ms: null,
+      response_format: "unknown",
+      content_type: null,
+      raw: undefined,
+      error: "DoH 查询失败。",
+      attempted_formats: [],
+      mode_results: [],
+    };
   }
-  if (!merged.content_type) {
-    merged.content_type = results.map((item) => item.content_type).find((type) => Boolean(type)) ?? null;
-  }
-  if (merged.status === null) {
+
+  const last = results[results.length - 1];
+  let status = last.status;
+  let latency = last.latency_ms;
+  let responseFormat = last.response_format;
+  let contentType = last.content_type ?? null;
+  let raw = last.raw;
+
+  if (status === null) {
     for (const item of [...results].reverse()) {
       if (item.status !== null) {
-        merged.status = item.status;
+        status = item.status;
         break;
       }
     }
   }
-  if (merged.latency_ms === null) {
+
+  if (latency === null) {
     for (const item of [...results].reverse()) {
       if (item.latency_ms !== null) {
-        merged.latency_ms = item.latency_ms;
+        latency = item.latency_ms;
         break;
       }
     }
   }
+
+  if (!responseFormat || responseFormat === "unknown") {
+    responseFormat = results.map((item) => item.response_format).find((format) => format && format !== "unknown") ?? "unknown";
+  }
+
+  if (!contentType) {
+    contentType = results.map((item) => item.content_type).find((type) => Boolean(type)) ?? null;
+  }
+
   const errors = results.map((item) => item.error).filter(Boolean) as string[];
-  merged.error = errors.length > 0 ? errors.join(" | ") : "DoH 查询失败。";
-  merged.ips = Array.from(new Set(results.flatMap((item) => item.ips)));
-  merged.ok = merged.ips.length > 0 && (merged.status ?? 0) >= 200 && (merged.status ?? 0) < 400;
-  return merged;
+
+  return {
+    status,
+    ok: false,
+    ips: Array.from(new Set(results.flatMap((item) => item.ips))),
+    latency_ms: latency,
+    response_format: responseFormat,
+    content_type: contentType,
+    raw,
+    error: errors.length > 0 ? errors.join(" | ") : "DoH 查询失败。",
+    attempted_formats: results.map((item) => item.mode),
+    mode_results: results,
+  };
 }
 
 function combineEchFailures(results: EchProviderResult[]): EchProviderResult {
@@ -1221,10 +1265,34 @@ const HTML_PAGE = /* html */ `<!DOCTYPE html>
     .details {
       margin-top: 12px;
     }
-    .support-info {
-      margin-top: 8px;
-      font-size: 0.95rem;
+    .mode-cards {
+      margin-top: 16px;
+      display: grid;
+      gap: 12px;
+    }
+    .mode-card {
+      padding: 14px 16px;
+      border-radius: 12px;
+      border: 1px solid rgba(37, 99, 235, 0.25);
+      background: rgba(255, 255, 255, 0.75);
+      box-shadow: 0 10px 24px -18px rgba(37, 99, 235, 0.4);
+    }
+    .mode-card.success {
+      border-color: var(--success);
+    }
+    .mode-card.failure {
+      border-color: var(--error);
+    }
+    .mode-card h3 {
+      margin: 0 0 6px;
+      font-size: 1.05rem;
+    }
+    .mode-card p {
+      margin: 4px 0;
+    }
+    .mode-card .meta {
       color: var(--muted);
+      font-size: 0.9rem;
     }
     details summary {
       cursor: pointer;
@@ -1355,7 +1423,7 @@ const HTML_PAGE = /* html */ `<!DOCTYPE html>
         const message = document.createElement('p');
         message.textContent = data.message;
         node.appendChild(message);
-        appendDohSupportInfo(node, data.details);
+        renderDohModeCards(node, data.details?.target);
         appendDetails(node, data);
       } else {
         if (data.ech_enabled) {
@@ -1398,44 +1466,53 @@ const HTML_PAGE = /* html */ `<!DOCTYPE html>
       node.appendChild(details);
     }
 
-  function appendDohSupportInfo(node, details) {
-    if (!details || !details.target) return;
-    const target = details.target;
-    const attemptedSet = new Set(target.attempted_formats || []);
-    const attemptedText = Array.from(attemptedSet).map(formatModeLabel).join('、');
-    const contentType = target.content_type || target.raw?.contentType || null;
+  function renderDohModeCards(node, targetDetail) {
+    const modes = targetDetail?.mode_results || [];
+    if (modes.length === 0) return;
 
-    const info = document.createElement('p');
-    info.classList.add('support-info');
+    const container = document.createElement('div');
+    container.classList.add('mode-cards');
 
-    let html = '<strong>请求格式支持：</strong>';
+    modes.forEach((entry) => {
+      const card = document.createElement('div');
+      card.classList.add('mode-card');
+      card.classList.add(entry.ok ? 'success' : 'failure');
 
-    if (target.ok && target.response_format && target.response_format !== 'unknown' && target.response_format !== 'text') {
-      const supportedLabel = formatModeLabel(target.response_format);
-      const extras = Array.from(attemptedSet).filter((fmt) => fmt !== target.response_format);
-      html += supportedLabel;
-      if (contentType) {
-        html += '（Content-Type: ' + contentType + '）';
-      }
-      if (extras.length > 0) {
-        html += '；同时尝试：' + extras.map(formatModeLabel).join('、');
-      }
-    } else if (target.response_format === 'text') {
-      html += '服务器返回文本响应';
-      if (contentType) {
-        html += '（Content-Type: ' + contentType + '）';
-      }
-      if (attemptedText) {
-        html += '；尝试：' + attemptedText;
-      }
-    } else if (attemptedText) {
-      html += '未检测到可用格式；尝试：' + attemptedText;
-    } else {
-      html += '未检测到可用格式';
-    }
+      const title = document.createElement('h3');
+      title.textContent = formatModeLabel(entry.mode);
+      card.appendChild(title);
 
-    info.innerHTML = html;
-    node.appendChild(info);
+      const statusLine = document.createElement('p');
+      statusLine.textContent = entry.ok
+        ? '✔ 请求成功'
+        : '✖ ' + (entry.error || '请求失败');
+      card.appendChild(statusLine);
+
+      if (entry.ips && entry.ips.length > 0) {
+        const ipLine = document.createElement('p');
+        ipLine.classList.add('meta');
+        ipLine.textContent = '解析 IP：' + entry.ips.join('、');
+        card.appendChild(ipLine);
+      }
+
+      const metaPieces = [];
+      if (typeof entry.latency_ms === 'number') {
+        metaPieces.push('耗时 ' + entry.latency_ms + ' ms');
+      }
+      if (entry.content_type) {
+        metaPieces.push('Content-Type: ' + entry.content_type);
+      }
+      if (metaPieces.length > 0) {
+        const meta = document.createElement('p');
+        meta.classList.add('meta');
+        meta.textContent = metaPieces.join(' | ');
+        card.appendChild(meta);
+      }
+
+      container.appendChild(card);
+    });
+
+    node.appendChild(container);
   }
 
   function formatModeLabel(mode) {
