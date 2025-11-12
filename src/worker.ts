@@ -9,11 +9,16 @@ type Mode = "doh" | "ech";
 
 type ProviderKey = "target" | "cloudflare" | "google";
 
+type DohResponseFormat = "json" | "wire" | "text" | "unknown";
+
 interface DohProviderResult {
   status: number | null;
   ok: boolean;
   ips: string[];
   latency_ms: number | null;
+  attempted_formats: DohRequestMode[];
+  response_format?: DohResponseFormat;
+  content_type?: string | null;
   raw?: unknown;
   error?: string;
 }
@@ -33,6 +38,9 @@ interface EchProviderResult {
   record?: string;
   status: number | null;
   latency_ms: number | null;
+  attempted_formats: DohRequestMode[];
+  response_format?: DohResponseFormat;
+  content_type?: string | null;
   error?: string;
   raw?: unknown;
 }
@@ -138,6 +146,9 @@ async function runDohCheck(targetUrl: string, testDomain: string, timeout: numbe
         ok: false,
         ips: [],
         latency_ms: null,
+        attempted_formats: [],
+        response_format: "unknown",
+        content_type: null,
         error: normalizeErrorMessage(entry.reason),
       } satisfies DohProviderResult];
     })
@@ -203,6 +214,9 @@ async function runEchCheck(domain: string, timeout: number): Promise<EchApiRespo
         record: undefined,
         status: null,
         latency_ms: null,
+        attempted_formats: [],
+        response_format: "unknown",
+        content_type: null,
         error: normalizeErrorMessage(entry.reason),
       } satisfies EchProviderResult];
     })
@@ -245,6 +259,9 @@ async function fetchDohAnswer(endpoint: string, name: string, recordType: string
     ok: false,
     ips: [],
     latency_ms: null,
+    attempted_formats: [],
+    response_format: "unknown",
+    content_type: null,
     error: "无法完成 DoH 查询。",
   };
 }
@@ -259,6 +276,9 @@ async function performDohRequest(endpoint: string, name: string, recordType: str
       ok: false,
       ips: [],
       latency_ms: null,
+      attempted_formats: [mode],
+      response_format: "unknown",
+      content_type: null,
       error: normalizeErrorMessage(error),
     };
   }
@@ -287,6 +307,9 @@ async function performDohRequest(endpoint: string, name: string, recordType: str
           ok,
           ips,
           latency_ms,
+          attempted_formats: [mode],
+          response_format: "json",
+          content_type: contentType,
           raw: json,
           error: ok ? undefined : "未在响应中找到有效的 A 记录。",
         };
@@ -296,6 +319,9 @@ async function performDohRequest(endpoint: string, name: string, recordType: str
           ok: false,
           ips: [],
           latency_ms,
+          attempted_formats: [mode],
+          response_format: "json",
+          content_type: contentType,
           raw: null,
           error: `解析 JSON 响应失败：${normalizeErrorMessage(error)}`,
         };
@@ -310,6 +336,9 @@ async function performDohRequest(endpoint: string, name: string, recordType: str
         ok: false,
         ips: [],
         latency_ms,
+        attempted_formats: [mode],
+        response_format: "text",
+        content_type: contentType,
         raw: snippet,
         error: snippet ? `服务器返回文本响应：${snippet}` : "服务器返回了文本响应。",
       };
@@ -326,6 +355,9 @@ async function performDohRequest(endpoint: string, name: string, recordType: str
         ok,
         ips,
         latency_ms,
+        attempted_formats: [mode],
+        response_format: "wire",
+        content_type: contentType,
         raw,
         error: ok ? undefined : "未在响应中找到有效的 A/AAAA 记录。",
       };
@@ -335,6 +367,9 @@ async function performDohRequest(endpoint: string, name: string, recordType: str
         ok: false,
         ips: [],
         latency_ms,
+        attempted_formats: [mode],
+        response_format: "wire",
+        content_type: contentType,
         raw,
         error: `解析 DNS 二进制报文失败：${normalizeErrorMessage(error)}`,
       };
@@ -345,6 +380,9 @@ async function performDohRequest(endpoint: string, name: string, recordType: str
       ok: false,
       ips: [],
       latency_ms: null,
+      attempted_formats: [mode],
+      response_format: "unknown",
+      content_type: null,
       error: normalizeErrorMessage(error),
     };
   }
@@ -374,6 +412,9 @@ async function fetchHttpsRecord(endpoint: string, domain: string, timeout: numbe
     record: undefined,
     status: null,
     latency_ms: null,
+    attempted_formats: [],
+    response_format: "unknown",
+    content_type: null,
     error: "无法完成 HTTPS 记录查询。",
   };
 }
@@ -390,6 +431,9 @@ async function performHttpsRequest(endpoint: string, domain: string, timeout: nu
       record: undefined,
       status: null,
       latency_ms: null,
+      attempted_formats: [mode],
+      response_format: "unknown",
+      content_type: null,
       error: normalizeErrorMessage(error),
     };
   }
@@ -418,6 +462,9 @@ async function performHttpsRequest(endpoint: string, domain: string, timeout: nu
           record: record ?? undefined,
           status,
           latency_ms,
+          attempted_formats: [mode],
+          response_format: "json",
+          content_type: contentType,
           raw: json,
           error: found ? undefined : "未发现包含 ECH 参数的 HTTPS 记录。",
         };
@@ -427,6 +474,9 @@ async function performHttpsRequest(endpoint: string, domain: string, timeout: nu
           record: undefined,
           status,
           latency_ms,
+          attempted_formats: [mode],
+          response_format: "json",
+          content_type: contentType,
           raw: null,
           error: `解析 JSON 响应失败：${normalizeErrorMessage(error)}`,
         };
@@ -441,6 +491,9 @@ async function performHttpsRequest(endpoint: string, domain: string, timeout: nu
         record: undefined,
         status,
         latency_ms,
+        attempted_formats: [mode],
+        response_format: "text",
+        content_type: contentType,
         raw: snippet,
         error: snippet ? `服务器返回文本响应：${snippet}` : "服务器返回了文本响应。",
       };
@@ -456,6 +509,9 @@ async function performHttpsRequest(endpoint: string, domain: string, timeout: nu
         record: record ?? undefined,
         status,
         latency_ms,
+        attempted_formats: [mode],
+        response_format: "wire",
+        content_type: contentType,
         raw,
         error: found ? undefined : error ?? "未发现包含 ECH 参数的 HTTPS 记录。",
       };
@@ -465,6 +521,9 @@ async function performHttpsRequest(endpoint: string, domain: string, timeout: nu
         record: undefined,
         status,
         latency_ms,
+        attempted_formats: [mode],
+        response_format: "wire",
+        content_type: contentType,
         raw,
         error: `解析 DNS 二进制报文失败：${normalizeErrorMessage(error)}`,
       };
@@ -475,6 +534,9 @@ async function performHttpsRequest(endpoint: string, domain: string, timeout: nu
       record: undefined,
       status: null,
       latency_ms: null,
+      attempted_formats: [mode],
+      response_format: "unknown",
+      content_type: null,
       error: normalizeErrorMessage(error),
     };
   }
@@ -500,6 +562,18 @@ function buildDohWireUrl(endpoint: string, name: string, type: string): URL {
 
 function combineDohFailures(results: DohProviderResult[]): DohProviderResult {
   const merged = { ...results[results.length - 1] };
+  merged.attempted_formats = Array.from(
+    new Set(results.flatMap((item) => item.attempted_formats ?? [])),
+  );
+  if (!merged.response_format || merged.response_format === "unknown") {
+    const responseFormat = results.map((item) => item.response_format).find((format) => format && format !== "unknown");
+    if (responseFormat) {
+      merged.response_format = responseFormat;
+    }
+  }
+  if (!merged.content_type) {
+    merged.content_type = results.map((item) => item.content_type).find((type) => Boolean(type)) ?? null;
+  }
   if (merged.status === null) {
     for (const item of [...results].reverse()) {
       if (item.status !== null) {
@@ -540,6 +614,18 @@ function combineEchFailures(results: EchProviderResult[]): EchProviderResult {
         break;
       }
     }
+  }
+  merged.attempted_formats = Array.from(
+    new Set(results.flatMap((item) => item.attempted_formats ?? [])),
+  );
+  if (!merged.response_format || merged.response_format === "unknown") {
+    const responseFormat = results.map((item) => item.response_format).find((format) => format && format !== "unknown");
+    if (responseFormat) {
+      merged.response_format = responseFormat;
+    }
+  }
+  if (!merged.content_type) {
+    merged.content_type = results.map((item) => item.content_type).find((type) => Boolean(type)) ?? null;
   }
   const errors = results.map((item) => item.error).filter(Boolean) as string[];
   merged.error = errors.length > 0 ? errors.join(" | ") : "HTTPS 记录查询失败。";
@@ -1135,6 +1221,11 @@ const HTML_PAGE = /* html */ `<!DOCTYPE html>
     .details {
       margin-top: 12px;
     }
+    .support-info {
+      margin-top: 8px;
+      font-size: 0.95rem;
+      color: var(--muted);
+    }
     details summary {
       cursor: pointer;
       font-weight: 600;
@@ -1264,6 +1355,7 @@ const HTML_PAGE = /* html */ `<!DOCTYPE html>
         const message = document.createElement('p');
         message.textContent = data.message;
         node.appendChild(message);
+        appendDohSupportInfo(node, data.details);
         appendDetails(node, data);
       } else {
         if (data.ech_enabled) {
@@ -1305,6 +1397,61 @@ const HTML_PAGE = /* html */ `<!DOCTYPE html>
       details.appendChild(pre);
       node.appendChild(details);
     }
+
+  function appendDohSupportInfo(node, details) {
+    if (!details || !details.target) return;
+    const target = details.target;
+    const attemptedSet = new Set(target.attempted_formats || []);
+    const attemptedText = Array.from(attemptedSet).map(formatModeLabel).join('、');
+    const contentType = target.content_type || target.raw?.contentType || null;
+
+    const info = document.createElement('p');
+    info.classList.add('support-info');
+
+    let html = '<strong>请求格式支持：</strong>';
+
+    if (target.ok && target.response_format && target.response_format !== 'unknown' && target.response_format !== 'text') {
+      const supportedLabel = formatModeLabel(target.response_format);
+      const extras = Array.from(attemptedSet).filter((fmt) => fmt !== target.response_format);
+      html += supportedLabel;
+      if (contentType) {
+        html += '（Content-Type: ' + contentType + '）';
+      }
+      if (extras.length > 0) {
+        html += '；同时尝试：' + extras.map(formatModeLabel).join('、');
+      }
+    } else if (target.response_format === 'text') {
+      html += '服务器返回文本响应';
+      if (contentType) {
+        html += '（Content-Type: ' + contentType + '）';
+      }
+      if (attemptedText) {
+        html += '；尝试：' + attemptedText;
+      }
+    } else if (attemptedText) {
+      html += '未检测到可用格式；尝试：' + attemptedText;
+    } else {
+      html += '未检测到可用格式';
+    }
+
+    info.innerHTML = html;
+    node.appendChild(info);
+  }
+
+  function formatModeLabel(mode) {
+    switch (mode) {
+      case 'json':
+        return 'JSON 查询 (name/type)';
+      case 'wire':
+        return 'DNS Message (dns=)';
+      case 'text':
+        return '文本响应';
+      case 'unknown':
+        return '未知';
+      default:
+        return mode;
+    }
+  }
   </script>
 </body>
 </html>`;
