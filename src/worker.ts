@@ -1388,7 +1388,7 @@ const HTML_PAGE = /* html */ `<!DOCTYPE html>
     .badge.success { color: var(--success); }
     .badge.failure { color: var(--error); }
     .badge.partial { color: var(--primary); }
-      .details {
+    .details {
         margin-top: 18px;
         border-radius: 14px;
         border: 1px solid rgba(37, 99, 235, 0.18);
@@ -1490,6 +1490,39 @@ const HTML_PAGE = /* html */ `<!DOCTYPE html>
       .notes-list li + li {
         margin-top: 6px;
       }
+    .ech-summary {
+      margin-top: 18px;
+      border-radius: 16px;
+      border: 1px solid rgba(37, 99, 235, 0.2);
+      background: rgba(255, 255, 255, 0.78);
+      padding: 18px 20px;
+      box-shadow: 0 20px 46px -26px rgba(37, 99, 235, 0.45);
+      display: grid;
+      gap: 14px;
+    }
+    .ech-summary h3 {
+      margin: 0;
+      font-size: 1.15rem;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .ech-summary .summary-status {
+      font-size: 0.95rem;
+      font-weight: 600;
+    }
+    .ech-summary .summary-status.success {
+      color: var(--success);
+    }
+    .ech-summary .summary-status.failure {
+      color: var(--error);
+    }
+    .ech-summary .summary-status.neutral {
+      color: var(--muted);
+    }
+    .ech-summary .provider-grid {
+      gap: 10px;
+    }
       .detail-status {
         font-weight: 600;
         font-size: 0.95rem;
@@ -1538,7 +1571,7 @@ const HTML_PAGE = /* html */ `<!DOCTYPE html>
       color: #f8fafc;
       padding: 16px;
       border-radius: 12px;
-      overflow: hidden;
+      overflow: auto;
       margin: 0;
       max-height: 280px;
       overflow-wrap: anywhere;
@@ -1633,40 +1666,46 @@ const HTML_PAGE = /* html */ `<!DOCTYPE html>
       const badge = document.createElement('div');
       badge.classList.add('badge');
 
-      if (!ok || data.status === 'error') {
-        badge.classList.add('failure');
-        badge.textContent = '✖ 检测失败';
-        node.appendChild(badge);
-        const message = document.createElement('p');
-        message.textContent = data.message || '请求失败，请稍后重试。';
-        node.appendChild(message);
-          appendDetails(node, data, mode);
-        node.classList.add('failure');
-        return;
+    if (!ok || data.status === 'error') {
+      badge.classList.add('failure');
+      badge.textContent = '✖ 检测失败';
+      node.appendChild(badge);
+      const message = document.createElement('p');
+      message.textContent = data.message || '请求失败，请稍后重试。';
+      node.appendChild(message);
+      if (mode === 'doh' && data?.ech_comparison) {
+        renderEchComparisonSummary(node, data.ech_comparison);
       }
+      appendDetails(node, data, mode);
+      node.classList.add('failure');
+      return;
+    }
 
-      if (mode === 'doh') {
-        const status = data.status;
-        if (status === 'success') {
-          badge.classList.add('success');
-          badge.textContent = '✔ 校验通过';
-          node.classList.add('success');
-        } else if (status === 'partial_match') {
-          badge.classList.add('partial');
-          badge.textContent = '△ 部分匹配';
-          node.classList.add('partial');
-        } else {
-          badge.classList.add('failure');
-          badge.textContent = '✖ 结果不一致';
-          node.classList.add('failure');
-        }
-        node.appendChild(badge);
-        const message = document.createElement('p');
-        message.textContent = data.message;
-        node.appendChild(message);
-        renderDohModeCards(node, data.details?.target);
-          appendDetails(node, data, mode);
+    if (mode === 'doh') {
+      const status = data.status;
+      if (status === 'success') {
+        badge.classList.add('success');
+        badge.textContent = '✔ 校验通过';
+        node.classList.add('success');
+      } else if (status === 'partial_match') {
+        badge.classList.add('partial');
+        badge.textContent = '△ 部分匹配';
+        node.classList.add('partial');
       } else {
+        badge.classList.add('failure');
+        badge.textContent = '✖ 结果不一致';
+        node.classList.add('failure');
+      }
+      node.appendChild(badge);
+      const message = document.createElement('p');
+      message.textContent = data.message;
+      node.appendChild(message);
+      if (data.ech_comparison) {
+        renderEchComparisonSummary(node, data.ech_comparison);
+      }
+      renderDohModeCards(node, data.details?.target);
+      appendDetails(node, data, mode);
+    } else {
         if (data.ech_enabled) {
           badge.classList.add('success');
           badge.textContent = '✔ ECH 已启用';
@@ -1680,7 +1719,7 @@ const HTML_PAGE = /* html */ `<!DOCTYPE html>
         const message = document.createElement('p');
         message.textContent = data.message;
         node.appendChild(message);
-          appendDetails(node, data, mode);
+      appendDetails(node, data, mode);
       }
     }
 
@@ -1694,6 +1733,49 @@ const HTML_PAGE = /* html */ `<!DOCTYPE html>
       message.textContent = error?.message || String(error);
       node.appendChild(message);
     }
+
+  function renderEchComparisonSummary(node, comparison) {
+    const section = document.createElement('section');
+    section.classList.add('ech-summary');
+
+    const title = document.createElement('h3');
+    title.textContent = 'ECH 配置校验结果';
+    section.appendChild(title);
+
+    const status = document.createElement('div');
+    status.classList.add('summary-status');
+    if (comparison.consistent === true) {
+      status.classList.add('success');
+      status.textContent = '目标 DoH 的 ECH 配置与权威解析完全一致。';
+    } else if (comparison.consistent === false) {
+      status.classList.add('failure');
+      status.textContent = '检测到目标 DoH 的 ECH 配置与权威解析不一致，可能存在篡改风险。';
+    } else {
+      status.classList.add('neutral');
+      status.textContent = '暂无法确认目标 DoH 的 ECH 配置是否与权威解析一致。';
+    }
+    section.appendChild(status);
+
+    const grid = document.createElement('div');
+    grid.classList.add('provider-grid');
+    grid.appendChild(createEchProviderCard('target', comparison.target));
+    grid.appendChild(createEchProviderCard('cloudflare', comparison.cloudflare));
+    grid.appendChild(createEchProviderCard('google', comparison.google));
+    section.appendChild(grid);
+
+    if (Array.isArray(comparison.notes) && comparison.notes.length > 0) {
+      const list = document.createElement('ul');
+      list.classList.add('notes-list');
+      comparison.notes.forEach((note) => {
+        const item = document.createElement('li');
+        item.textContent = note;
+        list.appendChild(item);
+      });
+      section.appendChild(list);
+    }
+
+    node.appendChild(section);
+  }
 
       function appendDetails(node, data, mode) {
       const details = document.createElement('details');
